@@ -24,6 +24,8 @@ const DEFAULT_HIGHLIGHT: &str = "green";
 const ZIP_HEADER: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
 const OLE_HEADER: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
+const W16CID_NS: &str = "http://schemas.microsoft.com/office/word/2016/wordml/cid";
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const WP_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
@@ -37,6 +39,11 @@ const REL_TYPE_CORE_PROPS: &str =
     "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
 const REL_TYPE_COMMENTS: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+const REL_TYPE_COMMENTS_EXTENDED: &str =
+    "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
+const REL_TYPE_COMMENTS_IDS: &str =
+    "http://schemas.microsoft.com/office/2016/09/relationships/commentsIds";
+const REL_TYPE_PEOPLE: &str = "http://schemas.microsoft.com/office/2011/relationships/people";
 const REL_TYPE_FOOTNOTES: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
 const REL_TYPE_ENDNOTES: &str =
@@ -48,6 +55,12 @@ const REL_TYPE_FOOTER: &str =
 const CORE_PROPS_CONTENT_TYPE: &str = "application/vnd.openxmlformats-package.core-properties+xml";
 const COMMENTS_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+const COMMENTS_EXTENDED_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml";
+const COMMENTS_IDS_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsIds+xml";
+const PEOPLE_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.people+xml";
 const FOOTNOTES_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 const ENDNOTES_CONTENT_TYPE: &str =
@@ -1021,6 +1034,45 @@ pub fn inspect_normalization_file(input: &Path) -> Result<NormalizationReport> {
     Ok(inspect_normalization_bytes(&bytes))
 }
 
+fn verify_published_output_matches_candidate(output: &Path, candidate_bytes: &[u8]) -> Result<()> {
+    let published_bytes =
+        fs::read(output).with_context(|| format!("failed to read published output {}", output.display()))?;
+    let normalization = inspect_normalization_bytes(&published_bytes);
+    if !normalization.is_normalized {
+        bail!(
+            "published output mutated after write and is no longer automation-safe ({}; format={}):\n{}",
+            output.display(),
+            normalization.format.as_str(),
+            format_validation_issues(&normalization.details)
+        );
+    }
+    if published_bytes != candidate_bytes {
+        bail!(
+            "published output does not match the validated candidate after write: {}",
+            output.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_existing_output_is_safe_for_direct_write(output: &Path) -> Result<()> {
+    if !output.exists() {
+        return Ok(());
+    }
+
+    let normalization = inspect_normalization_file(output)?;
+    if normalization.is_normalized {
+        return Ok(());
+    }
+
+    bail!(
+        "refusing to overwrite existing non-normalized or protection-sensitive output in place ({}; format={}):\n{}",
+        output.display(),
+        normalization.format.as_str(),
+        format_validation_issues(&normalization.details)
+    );
+}
+
 pub fn normalize_docx_file(
     input: &Path,
     output: &Path,
@@ -1054,6 +1106,7 @@ pub fn normalize_docx_file(
                     output.display()
                 )
             })?;
+            verify_published_output_matches_candidate(output, &bytes)?;
             Ok(NormalizeWorkflowReport {
                 detected_format: normalization.format,
                 already_normalized: true,
@@ -1315,6 +1368,7 @@ fn publish_spec_file_to_docx_internal(
                 format!("failed to create output directory {}", parent.display())
             })?;
         }
+        ensure_existing_output_is_safe_for_direct_write(output)?;
 
         fs::copy(&candidate_output, output).with_context(|| {
             format!(
@@ -1323,6 +1377,7 @@ fn publish_spec_file_to_docx_internal(
                 output.display()
             )
         })?;
+        verify_published_output_matches_candidate(output, &output_bytes)?;
 
         Ok(PublishWorkflowReport {
             xml_parts_checked: candidate_validation.xml_parts_checked,
@@ -1449,6 +1504,7 @@ pub fn migrate_source_to_ooxml(
                 format!("failed to create output directory {}", parent.display())
             })?;
         }
+        ensure_existing_output_is_safe_for_direct_write(output)?;
 
         fs::copy(&migrated_output, output).with_context(|| {
             format!(
@@ -1457,6 +1513,10 @@ pub fn migrate_source_to_ooxml(
                 output.display()
             )
         })?;
+        let migrated_bytes = fs::read(&migrated_output).with_context(|| {
+            format!("failed to read validated migrated candidate {}", migrated_output.display())
+        })?;
+        verify_published_output_matches_candidate(output, &migrated_bytes)?;
 
         Ok(MigrationWorkflowReport {
             xml_parts_checked: candidate_validation.xml_parts_checked,
@@ -2156,10 +2216,10 @@ pub fn apply_spec_to_docx_bytes(
                 let part_name = part.resolve()?;
                 with_story_part_mut(&mut package, &part_name, |story| {
                     let anchor_index = find_anchor_index(story, &anchor)?;
-                    story.children.insert(
-                        anchor_index + 1,
-                        XMLNode::Element(make_comment_paragraph(comment, comment_id)?),
-                    );
+                    let Some(XMLNode::Element(paragraph)) = story.children.get_mut(anchor_index) else {
+                        bail!("anchor paragraph not found at index {anchor_index}");
+                    };
+                    attach_comment_to_paragraph(paragraph, comment_id)?;
                     Ok(())
                 })?;
             }
@@ -2717,8 +2777,10 @@ pub fn publish_session_to_next_version(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
+    ensure_existing_output_is_safe_for_direct_write(&resolved_output)?;
     fs::write(&resolved_output, &output_bytes)
         .with_context(|| format!("failed to publish {}", resolved_output.display()))?;
+    verify_published_output_matches_candidate(&resolved_output, &output_bytes)?;
     fs::write(&working_input, &output_bytes).with_context(|| {
         format!(
             "failed to refresh session working copy {}",
@@ -3118,6 +3180,43 @@ fn ensure_comments_part(package: &mut DocxPackage) -> Result<()> {
             None,
         )?;
     }
+    if package.get_file("word/commentsExtended.xml").is_none() {
+        package.set_file("word/commentsExtended.xml", minimal_comments_extended_xml());
+        ensure_override_content_type(
+            package,
+            "word/commentsExtended.xml",
+            COMMENTS_EXTENDED_CONTENT_TYPE,
+        )?;
+        add_relationship(
+            package,
+            DOCUMENT_XML_PATH,
+            REL_TYPE_COMMENTS_EXTENDED,
+            "commentsExtended.xml",
+            None,
+        )?;
+    }
+    if package.get_file("word/commentsIds.xml").is_none() {
+        package.set_file("word/commentsIds.xml", minimal_comments_ids_xml());
+        ensure_override_content_type(package, "word/commentsIds.xml", COMMENTS_IDS_CONTENT_TYPE)?;
+        add_relationship(
+            package,
+            DOCUMENT_XML_PATH,
+            REL_TYPE_COMMENTS_IDS,
+            "commentsIds.xml",
+            None,
+        )?;
+    }
+    if package.get_file("word/people.xml").is_none() {
+        package.set_file("word/people.xml", minimal_people_xml());
+        ensure_override_content_type(package, "word/people.xml", PEOPLE_CONTENT_TYPE)?;
+        add_relationship(
+            package,
+            DOCUMENT_XML_PATH,
+            REL_TYPE_PEOPLE,
+            "people.xml",
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -3433,11 +3532,17 @@ fn append_comment_entry(
     comment_id: u32,
     comment: &CommentSpec,
 ) -> Result<()> {
+    let comment_para_id = next_hex_attr_id(package, "word/comments.xml", "comment", "paraId")?;
     with_xml_part_mut(package, "word/comments.xml", |root| {
+        let namespaces = root.namespaces.get_or_insert_with(Namespace::empty);
+        if namespaces.get("w15").is_none() {
+            namespaces.put("w15".to_string(), W15_NS.to_string());
+        }
         root.children
-            .push(XMLNode::Element(make_comment_entry(comment, comment_id)?));
+            .push(XMLNode::Element(make_comment_entry(comment, comment_id, &comment_para_id)?));
         Ok(())
-    })
+    })?;
+    append_comment_compatibility_metadata(package, &comment_para_id, &comment.author)
 }
 
 fn read_comments_from_package(package: &DocxPackage) -> Result<Vec<CommentRecord>> {
@@ -3526,6 +3631,16 @@ fn collect_comment_ids(element: &Element, output: &mut Vec<u32>) {
     }
 }
 
+fn element_contains_comment_markup(element: &Element) -> bool {
+    matches!(
+        local_name(&element.name),
+        "commentRangeStart" | "commentRangeEnd" | "commentReference"
+    ) || element.children.iter().any(|child| match child {
+        XMLNode::Element(inner) => element_contains_comment_markup(inner),
+        _ => false,
+    })
+}
+
 fn comment_id_of_element(element: &Element) -> Option<u32> {
     element
         .attributes
@@ -3574,7 +3689,7 @@ fn make_comment_entry_from_record(record: &CommentRecord) -> Result<Element> {
         style: ParagraphStyle::Normal,
         highlight: record.highlight.clone(),
     };
-    make_comment_entry(&spec, record.id)
+    make_comment_entry(&spec, record.id, "00000000")
 }
 
 fn first_highlight(element: &Element) -> Option<String> {
@@ -3661,6 +3776,21 @@ fn next_named_id(package: &DocxPackage, part_name: &str, element_local_name: &st
     Ok(max_id + 1)
 }
 
+fn next_hex_attr_id(
+    package: &DocxPackage,
+    part_name: &str,
+    element_local_name: &str,
+    attr_local_name: &str,
+) -> Result<String> {
+    let bytes = package
+        .get_file(part_name)
+        .with_context(|| format!("missing part {part_name}"))?;
+    let root = parse_xml(bytes)?;
+    let mut max_id = 0u32;
+    collect_max_hex_attr_id(&root, element_local_name, attr_local_name, &mut max_id);
+    Ok(format!("{:08X}", max_id + 1))
+}
+
 fn collect_max_named_id(element: &Element, target_local_name: &str, max_id: &mut u32) {
     if local_name(&element.name) == target_local_name
         && let Some(id) = element
@@ -3678,6 +3808,35 @@ fn collect_max_named_id(element: &Element, target_local_name: &str, max_id: &mut
             collect_max_named_id(element, target_local_name, max_id);
         }
     }
+}
+
+fn collect_max_hex_attr_id(
+    element: &Element,
+    element_local_name: &str,
+    attr_local_name: &str,
+    max_id: &mut u32,
+) {
+    if local_name(&element.name) == element_local_name
+        && let Some(value) = attr_value_local(element, attr_local_name)
+        && let Ok(parsed) = u32::from_str_radix(value, 16)
+    {
+        *max_id = (*max_id).max(parsed);
+    }
+
+    for child in &element.children {
+        if let XMLNode::Element(element) = child {
+            collect_max_hex_attr_id(element, element_local_name, attr_local_name, max_id);
+        }
+    }
+}
+
+fn attr_value_local<'a>(element: &'a Element, attr_local_name: &str) -> Option<&'a str> {
+    element.attributes.iter().find_map(|(key, value)| {
+        key.rsplit(':')
+            .next()
+            .filter(|local| *local == attr_local_name)
+            .map(|_| value.as_str())
+    })
 }
 
 fn next_change_id(story: &Element) -> u32 {
@@ -3728,36 +3887,203 @@ fn collect_max_sdt_id(element: &Element, max_id: &mut u32) {
     }
 }
 
-fn make_comment_entry(comment: &CommentSpec, comment_id: u32) -> Result<Element> {
-    let initials = comment.initials.as_deref().unwrap_or("");
-    let date = comment.date.as_deref().unwrap_or("2026-01-01T00:00:00Z");
-    parse_wrapped_fragment(&format!(
-        r#"<w:comment w:id="{comment_id}" w:author="{author}" w:initials="{initials}" w:date="{date}">
-<w:p><w:r><w:rPr><w:highlight w:val="{highlight}" /></w:rPr><w:t xml:space="preserve">{text}</w:t></w:r></w:p>
-</w:comment>"#,
-        comment_id = comment_id,
-        author = escape_xml_attr(&comment.author),
-        initials = escape_xml_attr(initials),
-        date = escape_xml_attr(date),
-        highlight = escape_xml_attr(&comment.highlight),
-        text = escape_xml_text(&comment.comment_text),
-    ))
+fn append_comment_compatibility_metadata(
+    package: &mut DocxPackage,
+    comment_para_id: &str,
+    author: &str,
+) -> Result<()> {
+    if package.get_file("word/commentsExtended.xml").is_some() {
+        with_xml_part_mut(package, "word/commentsExtended.xml", |root| {
+            root.children.push(XMLNode::Element(make_comment_ex_element(comment_para_id)));
+            Ok(())
+        })?;
+    }
+
+    if package.get_file("word/commentsIds.xml").is_some() {
+        let durable_id = next_hex_attr_id(package, "word/commentsIds.xml", "commentId", "durableId")?;
+        with_xml_part_mut(package, "word/commentsIds.xml", |root| {
+            root.children.push(XMLNode::Element(make_comment_id_element(
+                comment_para_id,
+                &durable_id,
+            )));
+            Ok(())
+        })?;
+    }
+
+    if package.get_file("word/people.xml").is_some() {
+        let already_exists = {
+            let bytes = package
+                .get_file("word/people.xml")
+                .with_context(|| "missing part word/people.xml".to_string())?;
+            let root = parse_xml(bytes)?;
+            root.children.iter().any(|child| match child {
+                XMLNode::Element(element) if local_name(&element.name) == "person" => {
+                    attr_value_local(element, "author") == Some(author)
+                }
+                _ => false,
+            })
+        };
+        if !already_exists {
+            with_xml_part_mut(package, "word/people.xml", |root| {
+                root.children
+                    .push(XMLNode::Element(make_person_element(author)));
+                Ok(())
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
-fn make_comment_paragraph(comment: &CommentSpec, comment_id: u32) -> Result<Element> {
-    parse_wrapped_fragment(&format!(
-        r#"<w:p>
-<w:pPr><w:pStyle w:val="{style}" /></w:pPr>
-<w:commentRangeStart w:id="{comment_id}" />
-<w:r><w:rPr><w:highlight w:val="{highlight}" /></w:rPr><w:t xml:space="preserve">{text}</w:t></w:r>
-<w:commentRangeEnd w:id="{comment_id}" />
-<w:r><w:rPr><w:rStyle w:val="CommentReference" /></w:rPr><w:commentReference w:id="{comment_id}" /></w:r>
-</w:p>"#,
-        style = comment.style.style_id(),
-        comment_id = comment_id,
-        highlight = escape_xml_attr(&comment.highlight),
-        text = escape_xml_text(&comment.text),
-    ))
+fn simple_element(name: &str) -> Element {
+    Element::new(name)
+}
+
+fn simple_text_element(name: &str, text: &str) -> Element {
+    let mut element = simple_element(name);
+    element.children.push(XMLNode::Text(text.to_string()));
+    element
+}
+
+fn make_comment_ex_element(comment_para_id: &str) -> Element {
+    let mut element = simple_element("w15:commentEx");
+    element
+        .attributes
+        .insert("w15:paraId".to_string(), comment_para_id.to_string());
+    element
+        .attributes
+        .insert("w15:done".to_string(), "0".to_string());
+    element
+}
+
+fn make_comment_id_element(comment_para_id: &str, durable_id: &str) -> Element {
+    let mut element = simple_element("w16cid:commentId");
+    element
+        .attributes
+        .insert("w16cid:paraId".to_string(), comment_para_id.to_string());
+    element
+        .attributes
+        .insert("w16cid:durableId".to_string(), durable_id.to_string());
+    element
+}
+
+fn make_person_element(author: &str) -> Element {
+    let mut element = simple_element("w15:person");
+    element
+        .attributes
+        .insert("w15:author".to_string(), author.to_string());
+    element
+}
+
+fn make_comment_entry(comment: &CommentSpec, comment_id: u32, comment_para_id: &str) -> Result<Element> {
+    let initials = comment.initials.as_deref().unwrap_or("");
+    let date = comment.date.as_deref().unwrap_or("2026-01-01T00:00:00Z");
+
+    let mut comment_element = simple_element("w:comment");
+    comment_element
+        .attributes
+        .insert("w:id".to_string(), comment_id.to_string());
+    comment_element
+        .attributes
+        .insert("w:author".to_string(), comment.author.clone());
+    comment_element
+        .attributes
+        .insert("w:initials".to_string(), initials.to_string());
+    comment_element
+        .attributes
+        .insert("w:date".to_string(), date.to_string());
+
+    let mut paragraph = simple_element("w:p");
+    paragraph
+        .attributes
+        .insert("w15:paraId".to_string(), comment_para_id.to_string());
+
+    let mut ppr = simple_element("w:pPr");
+    let mut pstyle = simple_element("w:pStyle");
+    pstyle
+        .attributes
+        .insert("w:val".to_string(), "CommentText".to_string());
+    ppr.children.push(XMLNode::Element(pstyle));
+    paragraph.children.push(XMLNode::Element(ppr));
+
+    let mut annotation_run = simple_element("w:r");
+    let mut annotation_rpr = simple_element("w:rPr");
+    let mut annotation_style = simple_element("w:rStyle");
+    annotation_style
+        .attributes
+        .insert("w:val".to_string(), "CommentReference".to_string());
+    annotation_rpr.children.push(XMLNode::Element(annotation_style));
+    annotation_run
+        .children
+        .push(XMLNode::Element(annotation_rpr));
+    annotation_run
+        .children
+        .push(XMLNode::Element(simple_element("w:annotationRef")));
+    paragraph.children.push(XMLNode::Element(annotation_run));
+
+    let mut text_run = simple_element("w:r");
+    let mut text_rpr = simple_element("w:rPr");
+    let mut highlight = simple_element("w:highlight");
+    highlight
+        .attributes
+        .insert("w:val".to_string(), comment.highlight.clone());
+    text_rpr.children.push(XMLNode::Element(highlight));
+    text_run.children.push(XMLNode::Element(text_rpr));
+
+    let mut text = simple_text_element("w:t", &comment.comment_text);
+    text.attributes
+        .insert("xml:space".to_string(), "preserve".to_string());
+    text_run.children.push(XMLNode::Element(text));
+    paragraph.children.push(XMLNode::Element(text_run));
+
+    comment_element.children.push(XMLNode::Element(paragraph));
+    Ok(comment_element)
+}
+
+fn attach_comment_to_paragraph(paragraph: &mut Element, comment_id: u32) -> Result<()> {
+    if element_contains_comment_markup(paragraph) {
+        bail!(
+            "target paragraph already contains comment markup; add-comment cannot safely add another comment to the same paragraph yet"
+        );
+    }
+
+    let mut start = simple_element("w:commentRangeStart");
+    start
+        .attributes
+        .insert("w:id".to_string(), comment_id.to_string());
+
+    let mut end = simple_element("w:commentRangeEnd");
+    end.attributes
+        .insert("w:id".to_string(), comment_id.to_string());
+
+    let mut reference = simple_element("w:r");
+    let mut reference_rpr = simple_element("w:rPr");
+    let mut reference_style = simple_element("w:rStyle");
+    reference_style
+        .attributes
+        .insert("w:val".to_string(), "CommentReference".to_string());
+    reference_rpr
+        .children
+        .push(XMLNode::Element(reference_style));
+    reference.children.push(XMLNode::Element(reference_rpr));
+
+    let mut comment_reference = simple_element("w:commentReference");
+    comment_reference
+        .attributes
+        .insert("w:id".to_string(), comment_id.to_string());
+    reference
+        .children
+        .push(XMLNode::Element(comment_reference));
+
+    let insert_at = paragraph
+        .children
+        .iter()
+        .position(|child| !matches!(child, XMLNode::Element(element) if local_name(&element.name) == "pPr"))
+        .unwrap_or(paragraph.children.len());
+    paragraph.children.insert(insert_at, XMLNode::Element(start));
+    paragraph.children.push(XMLNode::Element(end));
+    paragraph.children.push(XMLNode::Element(reference));
+    Ok(())
 }
 
 fn make_note_entry(kind: &NoteKind, note: &NoteSpec, note_id: u32) -> Result<Element> {
@@ -3898,6 +4224,27 @@ fn minimal_comments_xml() -> Vec<u8> {
     br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:comments>"#
         .to_vec()
+}
+
+fn minimal_comments_extended_xml() -> Vec<u8> {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w15:commentsEx xmlns:w15="{W15_NS}"></w15:commentsEx>"#
+    )
+    .into_bytes()
+}
+
+fn minimal_comments_ids_xml() -> Vec<u8> {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w16cid:commentsIds xmlns:w16cid="{W16CID_NS}"></w16cid:commentsIds>"#
+    )
+    .into_bytes()
+}
+
+fn minimal_people_xml() -> Vec<u8> {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w15:people xmlns:w15="{W15_NS}"></w15:people>"#
+    )
+    .into_bytes()
 }
 
 fn minimal_footnotes_xml() -> Vec<u8> {
@@ -4105,7 +4452,7 @@ fn run_props_xml(bold: bool, italic: bool, underline: bool) -> String {
 
 fn parse_wrapped_fragment(fragment: &str) -> Result<Element> {
     let wrapped = format!(
-        r#"<root xmlns:w="{W_NS}" xmlns:r="{R_NS}" xmlns:wp="{WP_NS}" xmlns:a="{A_NS}" xmlns:pic="{PIC_NS}">{fragment}</root>"#
+        r#"<root xmlns:w="{W_NS}" xmlns:w15="{W15_NS}" xmlns:w16cid="{W16CID_NS}" xmlns:r="{R_NS}" xmlns:wp="{WP_NS}" xmlns:a="{A_NS}" xmlns:pic="{PIC_NS}">{fragment}</root>"#
     );
     let root = parse_xml(wrapped.as_bytes())?;
     root.children
@@ -5039,6 +5386,33 @@ mod tests {
     }
 
     #[test]
+    fn verify_published_output_matches_candidate_accepts_identical_bytes() {
+        let dir = tempdir().expect("temp dir");
+        let output_path = dir.path().join("output.docx");
+        let bytes = make_minimal_docx().expect("docx");
+        fs::write(&output_path, &bytes).expect("write output");
+
+        verify_published_output_matches_candidate(&output_path, &bytes)
+            .expect("published output should match candidate");
+    }
+
+    #[test]
+    fn verify_published_output_matches_candidate_rejects_mutated_output() {
+        let dir = tempdir().expect("temp dir");
+        let output_path = dir.path().join("output.docx");
+        let candidate = make_minimal_docx().expect("docx");
+        let mut mutated = OLE_HEADER.to_vec();
+        mutated.extend_from_slice(&utf16le_bytes("EncryptedPackage"));
+        fs::write(&output_path, &mutated).expect("write mutated output");
+
+        let err = verify_published_output_matches_candidate(&output_path, &candidate)
+            .expect_err("published output should be rejected");
+        let message = format!("{err:#}");
+        assert!(message.contains("published output mutated after write"));
+        assert!(message.contains("ole-encrypted-package"));
+    }
+
+    #[test]
     fn spec_validation_rejects_unsupported_highlight() {
         let spec = AutomationSpec {
             operations: vec![Operation::InsertParagraphs {
@@ -5154,6 +5528,46 @@ mod tests {
         assert_eq!(report.version_number, 10);
         assert!(report.published_output.ends_with("versioned-document-v010.docx"));
         assert_eq!(report.mode, PublishTargetMode::Latest);
+    }
+
+    #[test]
+    fn publish_next_latest_rejects_existing_non_normalized_output() {
+        let dir = tempdir().expect("temp dir");
+        let input_path = dir.path().join("versioned-document-v007.docx");
+        let existing_path = dir.path().join("versioned-document-v010.docx");
+        let temp_root = dir.path().join("temp-root");
+        fs::write(&input_path, make_minimal_docx().expect("docx")).expect("write input");
+        let mut protected = OLE_HEADER.to_vec();
+        protected.extend_from_slice(&utf16le_bytes("EncryptedPackage"));
+        fs::write(&existing_path, protected).expect("write protected existing");
+
+        let spec = AutomationSpec {
+            operations: vec![Operation::InsertParagraphs {
+                part: PartTarget::default(),
+                anchor: AnchorTarget::Simple("Strategic principles".to_string()),
+                entries: vec![ParagraphEntry {
+                    text: "Continue working paragraph".to_string(),
+                    style: ParagraphStyle::Normal,
+                    highlight: "green".to_string(),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                }],
+            }],
+        };
+
+        let err = publish_spec_file_to_next_version(
+            &input_path,
+            &spec,
+            dir.path(),
+            Some(&temp_root),
+            None,
+            PublishTargetMode::Latest,
+        )
+        .expect_err("latest publish should reject protected output");
+        let message = format!("{err:#}");
+        assert!(message.contains("refusing to overwrite existing non-normalized"));
+        assert!(message.contains("ole-encrypted-package"));
     }
 
     #[test]
@@ -5276,7 +5690,7 @@ mod tests {
             listed[0]
                 .locations
                 .iter()
-                .any(|location| location.paragraph_text.contains("Copilot review"))
+                .any(|location| location.paragraph_text.contains("Strategic principles"))
         );
 
         update_docx_comment(

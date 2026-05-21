@@ -11,8 +11,7 @@ use wordflow::{
     list_docx_comments, prepare_work_session, publish_session_to_next_version,
     publish_spec_file_to_docx, publish_spec_file_to_next_version, update_docx_comment,
     validate_docx_file, validate_source_fidelity_file, validate_spec_file, ParagraphStyle,
-    PublishTargetMode,
-    reconstruct_session, show_session, track_session,
+    PublishTargetMode, reconstruct_session, show_session, track_session,
 };
 
 #[derive(Parser, Debug)]
@@ -278,7 +277,7 @@ enum Commands {
         /// Folder containing the versioned .docx files.
         #[arg(long)]
         folder: PathBuf,
-        /// Document stem (base name without version suffix, e.g. "strategy").
+        /// Document stem without version suffix (e.g. "report").
         #[arg(long)]
         document: String,
     },
