@@ -1,0 +1,105 @@
+{
+  "operations": [
+    {
+      "type": "insert-paragraphs",
+      "anchor": "Strategic principles",
+      "entries": [
+        {
+          "text": "Delivery plan",
+          "style": "heading2",
+          "highlight": "magenta"
+        },
+        {
+          "text": "Create a clean owner-based execution plan for the next milestone.",
+          "style": "quote",
+          "highlight": "magenta"
+        },
+        {
+          "text": "Document onboarding updates",
+          "style": "list-number",
+          "highlight": "magenta"
+        },
+        {
+          "text": "Publish a validated reviewed version",
+          "style": "list-number",
+          "highlight": "magenta"
+        }
+      ]
+    },
+    {
+      "type": "insert-table-after",
+      "anchor": "Strategic principles",
+      "table": {
+        "style": "TableGrid",
+        "highlight": "magenta",
+        "rows": [
+          {
+            "cells": [
+              "Workstream",
+              "Owner",
+              "Status"
+            ]
+          },
+          {
+            "cells": [
+              "Documentation",
+              "Documentation team",
+              "In progress"
+            ]
+          },
+          {
+            "cells": [
+              "Review workflow",
+              "Program lead",
+              "Planned"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "insert-content-control-after",
+      "anchor": "Strategic principles",
+      "control": {
+        "tag": "delivery-summary",
+        "alias": "Delivery Summary",
+        "text": "Summarize milestone status here.",
+        "style": "quote",
+        "highlight": "magenta"
+      }
+    },
+    {
+      "type": "insert-field-after",
+      "anchor": "Strategic principles",
+      "field": {
+        "instruction": " DATE ",
+        "result": "2026-05-20",
+        "style": "normal",
+        "highlight": "magenta"
+      }
+    },
+    {
+      "type": "insert-section-break-after",
+      "anchor": "Strategic principles",
+      "break_type": "next-page"
+    },
+    {
+      "type": "upsert-header-footer",
+      "kind": "footer",
+      "reference": "default",
+      "section_index": 0,
+      "entries": [
+        {
+          "text": "Structured update sample",
+          "style": "normal",
+          "highlight": "magenta"
+        }
+      ]
+    },
+    {
+      "type": "set-core-property",
+      "property": "title",
+      "value": "Structured Update Sample"
+    }
+  ]
+}

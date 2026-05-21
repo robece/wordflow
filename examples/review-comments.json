@@ -1,0 +1,47 @@
+{
+  "operations": [
+    {
+      "type": "insert-comment-after",
+      "anchor": "Strategic principles",
+      "comment": {
+        "text": "GitHub Copilot CLI review",
+        "comment_text": "Please clarify the review workflow and the approval handoff.",
+        "author": "GitHub Copilot CLI",
+        "initials": "GCC",
+        "date": "2026-05-20T00:00:00Z",
+        "style": "normal",
+        "highlight": "yellow"
+      }
+    },
+    {
+      "type": "track-insert-paragraphs",
+      "anchor": "Strategic principles",
+      "author": "GitHub Copilot CLI",
+      "date": "2026-05-20T00:00:00Z",
+      "entries": [
+        {
+          "text": "Add an explicit action item with owners and due dates.",
+          "style": "normal",
+          "highlight": "yellow"
+        }
+      ]
+    },
+    {
+      "type": "track-delete-paragraphs",
+      "contains": "future expansion opportunity",
+      "author": "GitHub Copilot CLI",
+      "date": "2026-05-20T00:00:00Z"
+    },
+    {
+      "type": "insert-note-after",
+      "anchor": "Strategic principles",
+      "kind": "footnote",
+      "note": {
+        "reference_text": "This footnote captures the open review concern.",
+        "body": "Use review comments for discussion points and tracked changes for proposed wording.",
+        "style": "normal",
+        "highlight": "yellow"
+      }
+    }
+  ]
+}

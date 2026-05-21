@@ -1,0 +1,149 @@
+{
+  "operations": [
+    {
+      "type": "insert-paragraphs",
+      "anchor": {
+        "text": "future expansion opportunity without diluting the current priority",
+        "mode": "equals",
+        "occurrence": 1
+      },
+      "entries": [
+        {
+          "text": "Use collaboration and editing tools when they reduce authoring, review, and delivery friction.",
+          "style": "list-bullet"
+        }
+      ]
+    },
+    {
+      "type": "insert-paragraphs",
+      "anchor": "not the primary growth lever today",
+      "entries": [
+        {
+          "text": "Documentation",
+          "style": "heading2"
+        },
+        {
+          "text": "Documentation guidance should explain how contributors author, review, and publish updates with minimal friction.",
+          "style": "normal"
+        },
+        {
+          "text": "Automation",
+          "style": "heading2"
+        },
+        {
+          "text": "Automation should reduce repetitive steps and keep validation and publishing behavior consistent.",
+          "style": "normal"
+        }
+      ]
+    },
+    {
+      "type": "insert-table-after",
+      "anchor": "Strategic principles",
+      "table": {
+        "style": "TableGrid",
+        "rows": [
+            {
+              "cells": [
+                "Area",
+                "Example"
+              ]
+            },
+            {
+              "cells": [
+                "Release workflow",
+                "Automated review and publishing steps reduce manual handoffs."
+              ]
+            }
+        ]
+      }
+    },
+    {
+      "type": "insert-hyperlink-after",
+      "anchor": "Strategic principles",
+      "hyperlink": {
+        "text": "Workflow reference",
+        "url": "https://learn.microsoft.com/azure/event-grid/",
+        "style": "normal",
+        "highlight": "green"
+      }
+    },
+    {
+      "type": "insert-comment-after",
+      "anchor": "Strategic principles",
+      "comment": {
+        "text": "Reviewer note",
+        "comment_text": "Include the rationale for the selected workflow.",
+        "author": "Copilot",
+        "initials": "CP"
+      }
+    },
+    {
+      "type": "insert-note-after",
+      "anchor": "Strategic principles",
+      "kind": "footnote",
+      "note": {
+        "reference_text": "Automated review and publishing steps",
+        "body": "This note explains the repeatable workflow pattern.",
+        "style": "normal"
+      }
+    },
+    {
+      "type": "insert-content-control-after",
+      "anchor": "Strategic principles",
+      "control": {
+        "tag": "scenario-summary",
+        "alias": "Scenario Summary",
+        "text": "Summarize the scenario here.",
+        "style": "quote"
+      }
+    },
+    {
+      "type": "insert-field-after",
+      "anchor": "Strategic principles",
+      "field": {
+        "instruction": " PAGE ",
+        "result": "1"
+      }
+    },
+    {
+      "type": "insert-section-break-after",
+      "anchor": "Strategic principles",
+      "break_type": "next-page"
+    },
+    {
+      "type": "track-insert-paragraphs",
+      "anchor": "Strategic principles",
+      "author": "Copilot",
+      "date": "2026-05-18T00:00:00Z",
+      "entries": [
+        {
+          "text": "Tracked insertion for review.",
+          "style": "normal"
+        }
+      ]
+    },
+    {
+      "type": "track-delete-paragraphs",
+      "contains": "future expansion opportunity",
+      "author": "Copilot",
+      "date": "2026-05-18T00:00:00Z"
+    },
+    {
+      "type": "set-core-property",
+      "property": "title",
+      "value": "Document Update Sample"
+    },
+    {
+      "type": "upsert-header-footer",
+      "kind": "header",
+      "reference": "default",
+      "section_index": 0,
+      "entries": [
+        {
+          "text": "Document Update Sample",
+          "style": "normal"
+        }
+      ]
+    }
+  ]
+}
