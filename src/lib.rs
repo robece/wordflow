@@ -1994,14 +1994,12 @@ function Get-ParagraphSignatureObjects($document) {{
     }}
 
     $highlights = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($character in $paragraph.Range.Characters) {{
-      try {{
-        $idx = [int]$character.HighlightColorIndex
-        if ($idx -gt 0) {{
-          [void]$highlights.Add($idx.ToString())
-        }}
-      }} catch {{
+    try {{
+      $idx = [int]$paragraph.Range.HighlightColorIndex
+      if ($idx -gt 0) {{
+        [void]$highlights.Add($idx.ToString())
       }}
+    }} catch {{
     }}
 
     $items += [pscustomobject]@{{
