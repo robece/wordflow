@@ -87,11 +87,16 @@ pub fn document_stem(path: &Path) -> Option<String> {
     Some(re.replace(stem, "").to_string())
 }
 
-/// Derive `<dir>/<stem>.session.json` from a versioned .docx path.
+/// Derive `<dir>/.wordflow/<stem>.session.json` from a versioned .docx path.
 pub fn resolve_session_path(document_path: &Path) -> Option<PathBuf> {
     let dir = document_path.parent()?;
     let stem = document_stem(document_path)?;
-    Some(dir.join(format!("{stem}.session.json")))
+    let wordflow_dir = if dir.as_os_str().is_empty() {
+        std::env::current_dir().ok()?.join(".wordflow")
+    } else {
+        dir.join(".wordflow")
+    };
+    Some(wordflow_dir.join(format!("{stem}.session.json")))
 }
 
 // ── SessionFile impl ──────────────────────────────────────────────────────────
@@ -202,7 +207,7 @@ pub fn reconstruct_session(folder: &Path, document_stem_arg: &str) -> Result<Ses
             .unwrap_or(0)
     });
 
-    let session_path = folder.join(format!("{document_stem_arg}.session.json"));
+    let session_path = folder.join(".wordflow").join(format!("{document_stem_arg}.session.json"));
 
     let created_at = files.first()
         .map(|p| mtime_rfc3339(p))
@@ -253,4 +258,118 @@ pub fn reconstruct_session(folder: &Path, document_stem_arg: &str) -> Result<Ses
     session.save(&session_path)?;
 
     Ok(session)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn document_stem_strips_version_suffix() {
+        assert_eq!(document_stem(Path::new("report-v007.docx")).unwrap(), "report");
+        assert_eq!(document_stem(Path::new("doc-v1.docx")).unwrap(), "doc");
+        assert_eq!(document_stem(Path::new("strategy-V003.docx")).unwrap(), "strategy");
+    }
+
+    #[test]
+    fn document_stem_returns_full_stem_without_version() {
+        assert_eq!(document_stem(Path::new("report.docx")).unwrap(), "report");
+        assert_eq!(document_stem(Path::new("my-document.docx")).unwrap(), "my-document");
+    }
+
+    #[test]
+    fn resolve_session_path_derives_session_file() {
+        let path = Path::new("/folder/report-v007.docx");
+        let session = resolve_session_path(path).unwrap();
+        let s = session.to_string_lossy();
+        assert!(s.contains(".wordflow"), "expected .wordflow in path: {s}");
+        assert!(s.ends_with("report.session.json"), "expected report.session.json: {s}");
+    }
+
+    #[test]
+    fn resolve_session_path_works_without_version() {
+        let path = Path::new("/folder/report.docx");
+        let session = resolve_session_path(path).unwrap();
+        let s = session.to_string_lossy();
+        assert!(s.contains(".wordflow"), "expected .wordflow in path: {s}");
+        assert!(s.ends_with("report.session.json"), "expected report.session.json: {s}");
+    }
+
+    #[test]
+    fn epoch_secs_to_rfc3339_formats_unix_epoch() {
+        assert_eq!(epoch_secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn epoch_secs_to_rfc3339_formats_known_date() {
+        assert_eq!(epoch_secs_to_rfc3339(1735689600), "2025-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn is_leap_identifies_leap_years() {
+        assert!(is_leap(2000));
+        assert!(is_leap(2024));
+        assert!(!is_leap(1900));
+        assert!(!is_leap(2023));
+    }
+
+    #[test]
+    fn session_file_create_load_save_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.session.json");
+
+        let mut session = SessionFile::load_or_create(&path, "test-doc").unwrap();
+        assert_eq!(session.document, "test-doc");
+        assert!(session.entries.is_empty());
+
+        session.append(SessionEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            command: "publish".to_string(),
+            input: Some("input.docx".to_string()),
+            output: Some("output.docx".to_string()),
+            spec: Some("spec.json".to_string()),
+            result: "ok".to_string(),
+            note: None,
+        });
+        session.save(&path).unwrap();
+
+        let loaded = SessionFile::load(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].command, "publish");
+        assert_eq!(loaded.document, "test-doc");
+    }
+
+    #[test]
+    fn track_session_creates_and_appends_entries() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("report-v007.docx");
+        let input = dir.path().join("report-v006.docx");
+        let spec = dir.path().join("spec.json");
+
+        let session_path =
+            track_session(&output, "publish", Some(&input), Some(&spec), "ok", None).unwrap();
+        assert!(session_path.exists());
+
+        let session = SessionFile::load(&session_path).unwrap();
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(session.entries[0].command, "publish");
+        assert_eq!(session.entries[0].result, "ok");
+    }
+
+    #[test]
+    fn track_session_appends_multiple_entries() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("report-v007.docx");
+
+        track_session(&output, "first", None, None, "ok", None).unwrap();
+        track_session(&output, "second", None, None, "ok", Some("a note")).unwrap();
+
+        let session_path = resolve_session_path(&output).unwrap();
+        let session = SessionFile::load(&session_path).unwrap();
+        assert_eq!(session.entries.len(), 2);
+        assert_eq!(session.entries[0].command, "first");
+        assert_eq!(session.entries[1].command, "second");
+        assert_eq!(session.entries[1].note.as_deref(), Some("a note"));
+    }
 }

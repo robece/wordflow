@@ -2,9 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing_subscriber::{fmt, util::SubscriberInitExt, EnvFilter, Layer as _};
 use serde_json;
 use wordflow::{
     AnchorMatchMode, AnchorSpec, AnchorTarget, AutomationSpec, CommentSpec, CommentUpdate,
+    protect_document_from_session,
     add_comment_to_docx, apply_spec_file_to_docx, apply_spec_file_to_docx_dry_run,
     delete_docx_comment, diff_docx_files, find_anchors_in_docx,
     inspect_normalization_file, list_docx_parts, migrate_source_to_ooxml, normalize_docx_file,
@@ -60,8 +62,8 @@ enum Commands {
         spec: PathBuf,
 
         /// Temp root used for staging and candidate generation.
-        #[arg(long, default_value = r"C:\Temp\wordflow")]
-        temp_root: PathBuf,
+        #[arg(long)]
+        temp_root: Option<PathBuf>,
     },
     /// Publish to the next detected versioned filename (for example, v014 -> v015).
     PublishNext {
@@ -86,8 +88,8 @@ enum Commands {
         target: String,
 
         /// Temp root used for staging, session state, and candidate generation.
-        #[arg(long, default_value = r"C:\Temp\wordflow")]
-        temp_root: PathBuf,
+        #[arg(long)]
+        temp_root: Option<PathBuf>,
     },
     /// Prepare or reuse a normalized working copy inside a reusable temp session.
     PrepareSession {
@@ -100,8 +102,8 @@ enum Commands {
         session: String,
 
         /// Temp root used for session state and normalized working copies.
-        #[arg(long, default_value = r"C:\Temp\wordflow")]
-        temp_root: PathBuf,
+        #[arg(long)]
+        temp_root: Option<PathBuf>,
 
         /// Optional trusted OOXML reference used for fidelity comparison.
         #[arg(long)]
@@ -191,8 +193,8 @@ enum Commands {
         output: PathBuf,
 
         /// Temp root used for staging and migration artifacts.
-        #[arg(long, default_value = r"C:\Temp\wordflow")]
-        temp_root: PathBuf,
+        #[arg(long)]
+        temp_root: Option<PathBuf>,
 
         /// Optional trusted OOXML reference used for fidelity comparison.
         #[arg(long)]
@@ -209,8 +211,8 @@ enum Commands {
         output: PathBuf,
 
         /// Temp root reserved for future normalization backends.
-        #[arg(long, default_value = r"C:\Temp\wordflow")]
-        temp_root: PathBuf,
+        #[arg(long)]
+        temp_root: Option<PathBuf>,
 
         /// Optional trusted OOXML reference used for fidelity comparison.
         #[arg(long)]
@@ -281,9 +283,80 @@ enum Commands {
         #[arg(long)]
         document: String,
     },
+    /// Re-apply the original document protection to the latest published version in a session.
+    Protect {
+        /// Work-session identifier created by prepare-session.
+        #[arg(long)]
+        session: String,
+
+        /// Output path for the protected document.
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Password to re-apply if the original was password-encrypted.
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Temp root used for staging. Defaults to .wordflow/ adjacent to the session document.
+        #[arg(long)]
+        temp_root: Option<PathBuf>,
+    },
+}
+
+fn setup_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::Registry;
+
+    let log_dir = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".wordflow");
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let make_filter = || {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+
+    let stderr_layer: Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync> =
+        fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_target(false)
+            .with_filter(make_filter())
+            .boxed();
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("wordflow.log"))
+    {
+        Ok(file) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(file);
+            let file_layer: Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync> =
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .with_target(false)
+                    .with_filter(make_filter())
+                    .boxed();
+            tracing_subscriber::registry()
+                .with(vec![file_layer, stderr_layer])
+                .init();
+            Some(guard)
+        }
+        Err(_) => {
+            tracing_subscriber::registry()
+                .with(vec![stderr_layer])
+                .init();
+            None
+        }
+    }
 }
 
 fn main() -> Result<()> {
+    let _log_guard = setup_logging();
+    tracing::info!("wordflow {}", env!("CARGO_PKG_VERSION"));
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -319,7 +392,7 @@ fn main() -> Result<()> {
             let parsed = AutomationSpec::from_path(&spec)?;
             let spec_base = spec.parent().unwrap_or(std::path::Path::new("."));
             let report =
-                publish_spec_file_to_docx(&input, &output, &parsed, spec_base, Some(&temp_root))?;
+                publish_spec_file_to_docx(&input, &output, &parsed, spec_base, temp_root.as_deref())?;
             println!(
                 "Published {}\tXML checked\t{}",
                 report.published_output.display(),
@@ -352,7 +425,7 @@ fn main() -> Result<()> {
                     &input,
                     &parsed,
                     spec_base,
-                    Some(&temp_root),
+                    temp_root.as_deref(),
                     output_dir.as_deref(),
                     target_mode,
                 )?,
@@ -360,7 +433,7 @@ fn main() -> Result<()> {
                     &session_id,
                     &parsed,
                     spec_base,
-                    Some(&temp_root),
+                    temp_root.as_deref(),
                     output_dir.as_deref(),
                     target_mode,
                 )?,
@@ -397,7 +470,7 @@ fn main() -> Result<()> {
             let report = prepare_work_session(
                 &input,
                 &session,
-                Some(&temp_root),
+                temp_root.as_deref(),
                 trusted_ooxml.as_deref(),
                 allow_word_com_encrypted_package,
             )?;
@@ -408,6 +481,15 @@ fn main() -> Result<()> {
                 report.detected_format.as_str(),
                 report.normalized_input.display()
             );
+            if let Some(prot) = report.protection {
+                println!("Protection\t{}", prot.protection_type_name());
+                if prot.has_password {
+                    println!("PasswordRequired\ttrue");
+                }
+                if prot.irm_enabled {
+                    println!("IRM\ttrue");
+                }
+            }
         }
         Commands::ValidateSpec { spec } => {
             let operations = validate_spec_file(&spec)?;
@@ -504,7 +586,7 @@ fn main() -> Result<()> {
             let report = migrate_source_to_ooxml(
                 &input,
                 &output,
-                Some(&temp_root),
+                temp_root.as_deref(),
                 trusted_ooxml.as_deref(),
             )?;
             println!(
@@ -526,7 +608,7 @@ fn main() -> Result<()> {
             let report = normalize_docx_file(
                 &input,
                 &output,
-                Some(&temp_root),
+                temp_root.as_deref(),
                 trusted_ooxml.as_deref(),
                 allow_word_com_encrypted_package,
             )?;
@@ -632,6 +714,24 @@ fn main() -> Result<()> {
                 "Reconstructed {} entries — saved to {}.session.json",
                 session.entries.len(),
                 document
+            );
+        }
+        Commands::Protect {
+            session,
+            output,
+            password,
+            temp_root,
+        } => {
+            let report = protect_document_from_session(
+                &session,
+                &output,
+                password.as_deref(),
+                temp_root.as_deref(),
+            )?;
+            println!(
+                "Protected {}\tProtection\t{}",
+                report.protected_output.display(),
+                report.protection_type_name
             );
         }
     }

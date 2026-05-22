@@ -5,7 +5,7 @@
 Maintain `wordflow` as the reusable document-automation toolchain for Word workflows that need:
 
 - deterministic behavior
-- staging in `C:\Temp`
+- staging in `.wordflow/` adjacent to the document
 - fail-fast publish rules
 - explicit validation
 - explicit migration handling
@@ -65,6 +65,7 @@ If a feature is only partial, the README matrix must say so explicitly instead o
 | Header/footer and core properties | [x] | [ ] | reusable document-structure updates |
 | Validation, inspection, sessions, publish | [x] | [ ] | normalization, validation, fidelity checks, staged publish, reusable sessions |
 | Protected-source migration | [ ] | [x] | supported workflow, but still intentionally depends on a guarded Word-backed conversion path |
+| Protection round-trip | [x] | [ ] | `prepare-session` captures protection metadata; `protect` re-applies it — Windows only |
 
 ## Why this tool matters
 
@@ -91,7 +92,7 @@ Without this tool, the workflow becomes much more manual and less reliable:
 
 | Dimension | With `wordflow` | Without `wordflow` |
 |---|---|---|
-| Temp handling | staged in `C:\Temp` by default | ad hoc and manual |
+| Temp handling | staged in `.wordflow/` adjacent to the document | ad hoc and manual |
 | Candidate control | one candidate, explicit validation | often multiple trial outputs |
 | Publish behavior | destination touched only at the end | easy to touch destination too early |
 | Migration path | explicit `migrate` command | Word COM or manual conversion |
@@ -160,191 +161,29 @@ Commands:
 
 - `prepare-session`
 - `publish-next --session ...`
+- `protect --session ...`
 - comment review commands
 
 Use when:
 
 - a document family is versioned
 - the published output may be protection-sensitive or rewrapped
-- you want the cache to live under `C:\Temp`, not inside the `.docx`
+- you want the cache to live under `.wordflow/`, not inside the `.docx`
 - multiple edits should reuse the same normalized working copy
+- the source was protected and the final delivery must be protected again
 
 ## Command reference
 
-### `insert`
+See `README.md` for full command examples, usage patterns, and the feature support matrix. This file focuses on engineering contracts and maintenance rules, not on usage documentation.
 
-Low-level editing command.
+Command-specific engineering expectations:
 
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- insert `
-  --input "C:\path\source.docx" `
-  --output "C:\path\updated.docx" `
-  --spec ".\examples\document-update.json"
-```
-
-### `insert --dry-run`
-
-Low-risk validation of a spec without writing the output.
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- insert `
-  --input "C:\path\source.docx" `
-  --output "C:\path\ignored.docx" `
-  --spec ".\examples\document-update.json" `
-  --dry-run
-```
-
-### `normalize`
-
-Normalization preflight command.
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- normalize `
-  --input "C:\path\source.docx" `
-  --output "C:\path\normalized.docx"
-```
-
-Current expectation:
-
-- if the source is already a real OOXML zip package, `normalize` validates it and publishes a clean OOXML-safe copy
-- if the source is legacy, protected, or otherwise non-normalized, `normalize` must stop with an explicit explanation unless a reliable normalization backend is available
-- a guarded Word COM exception may be allowed only for detected `ole-encrypted-package` sources, and only inside `normalize`
-- that COM exception must never become the default path for general editing or publishing
-
-### `publish`
-
-Preferred command for final document generation.
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- publish `
-  --input "C:\path\source.docx" `
-  --output "C:\path\final.docx" `
-  --spec ".\examples\document-update.json"
-```
-
-### `publish-next`
-
-Version-aware publish command.
-
-Direct input:
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- publish-next `
-  --input "C:\path\document-v015.docx" `
-  --spec ".\examples\document-update.json"
-```
-
-Reusable session:
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- publish-next `
-  --session "my-doc-session" `
-  --spec ".\examples\document-update.json"
-```
-
-Current expectation:
-
-- the current filename must end in a version marker like `v001`
-- the next output should be derived from the highest existing matching version in the output directory
-- the default target mode should keep creating a new published version
-- an explicit `latest` target mode may update the latest published version in place when the caller intentionally wants to continue working without incrementing
-- when a session is used, the cached normalized working copy should advance to the newly validated content
-
-### `prepare-session`
-
-Reusable working-session command.
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- prepare-session `
-  --input "C:\path\source.docx" `
-  --session "my-doc-session"
-```
-
-Current expectation:
-
-- the cache belongs to the temp session, not to the document
-- the normalized working copy should be reused when the source path and source hash match
-- if the source changed, the session should refresh the normalized working copy
-
-### `validate-spec`
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- validate-spec `
-  --spec ".\examples\document-update.json"
-```
-
-Current expectation:
-
-- invalid highlight values must fail before document editing starts
-- unsupported part targets must fail before document editing starts
-- empty anchors and missing assets must fail before document editing starts
-
-### Comment review commands
-
-Commands:
-
-- `add-comment`
-- `list-comments`
-- `update-comment`
-- `delete-comment`
-
-Current expectation:
-
-- comments should support a reviewer workflow, including GitHub Copilot CLI as a reasonable default reviewer identity
-- delete must remove both the comment entry and its in-document references
-- update must preserve a valid OOXML package after mutation
-- list must expose enough information for a caller to understand comment ids, authors, and where the comment is attached
-
-### `migrate`
-
-Preferred command for protected or ambiguous source documents.
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- migrate `
-  --input "C:\path\source.docx" `
-  --output "C:\path\migrated.docx"
-```
-
-With trusted OOXML reference:
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- migrate `
-  --input "C:\path\source.docx" `
-  --output "C:\path\migrated.docx" `
-  --trusted-ooxml "C:\path\trusted-base.docx"
-```
-
-### `validate`
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- validate --input "C:\path\source.docx"
-```
-
-### `check-fidelity`
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- check-fidelity `
-  --before "C:\path\trusted-base.docx" `
-  --after "C:\path\candidate.docx"
-```
-
-With spec:
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- check-fidelity `
-  --before "C:\path\trusted-base.docx" `
-  --after "C:\path\candidate.docx" `
-  --spec ".\examples\document-update.json"
-```
-
-### Inspection/debug commands
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc run -- inspect --input "C:\path\source.docx"
-cargo +stable-x86_64-pc-windows-msvc run -- list-parts --input "C:\path\source.docx"
-cargo +stable-x86_64-pc-windows-msvc run -- find-anchors --input "C:\path\source.docx" --text "Strategic principles" --mode equals --occurrence 2
-cargo +stable-x86_64-pc-windows-msvc run -- diff-docx --before "C:\path\old.docx" --after "C:\path\new.docx"
-```
+- `normalize`: may use Word COM only for detected `ole-encrypted-package` sources; that exception must never become the default path for general editing or publishing
+- `publish-next`: the filename must end in a version marker like `v001`; version incrementing happens only after the candidate is already validated and exactly one destination path has been chosen
+- `prepare-session`: the cache belongs to the work session, not to the document; reuse only when source path and source hash match
+- `validate-spec`: invalid highlights, unsupported part targets, empty anchors, and missing assets must all fail before any document edit runs
+- comment commands: `delete` must remove both the comment entry and its in-document references; `update` must preserve a valid OOXML package after mutation
+- `protect`: requires a session created from an encrypted or restricted source; must fail with a descriptive error if no protection metadata exists, if `--password` is missing when required, or if the original had no protection at all; uses `current_version_path` from session metadata as input — never requires `--input`
 
 ## Default operating assumptions
 
@@ -359,30 +198,25 @@ The tool should assume all of the following unless proven otherwise:
 
 ## Default runtime workspace
 
-Use:
+The default runtime workspace is `.wordflow/` created adjacent to the `--input` document:
 
-`C:\Temp\wordflow`
+```
+<input-document-directory>/
+└── .wordflow/
+    ├── wordflow.log                ← always-on structured log (INFO level)
+    ├── <stem>.session.json         ← publish audit trail (shared across all versions)
+    ├── run-<pid>-<stamp>/          ← ephemeral staging (cleaned on success)
+    └── sessions/
+        └── <session-id>/           ← persistent normalized working copy
+```
 
-as the default runtime workspace for:
+If the input has no parent directory (bare filename), `.wordflow/` is created in the current working directory.
 
-- publish
-- publish-next
-- migrate
-- session metadata and normalized working copies
-- intermediate candidate generation
-- temporary validation artifacts
-
-If the folder does not exist, the workflow should create it.
+The caller may override this with `--temp-root`. The directory is created automatically if it does not exist. `.wordflow/` is excluded from version control via `.gitignore`.
 
 ## Default build workspace
 
-Keep Cargo build artifacts and the runnable executable out of the source tree.
-
-Use:
-
-`C:\Temp\wordflow-target`
-
-as the default Cargo target directory so the repository under OneDrive remains source-only during normal `cargo build`, `cargo run`, and `cargo test` usage.
+Cargo build artifacts are placed in the default `target/` directory within the project. No external path configuration is required. The `.cargo/config.toml` does not override the target directory.
 
 ## Required engineering behaviors
 
@@ -457,59 +291,81 @@ Every document workflow should begin by checking whether the source is already n
 - editing and publish flows should stop early on non-normalized sources instead of failing later with low-level zip errors
 - non-normalized inputs should be treated as a workflow state, not as an unexpected crash
 
-## Session cache rule
+## Session concepts
 
-The cache belongs to the work session, not to the document.
+There are two distinct session concepts inside `.wordflow/` — do not confuse them:
 
-Cache examples:
+**1. Publish audit log** — `<stem>.session.json`
+
+A timestamped record of every successful `publish` and `publish-next` call. Written by `track_session` in `session.rs`. Shared across all versions of the same document family. Survives across tool runs indefinitely.
+
+**2. Work session cache** — `sessions/<session-id>/`
+
+A normalized working copy managed by `prepare-session`. Used by `publish-next --session` to avoid re-normalizing the source on every run. Keyed by session ID. Reused when the source path and hash match; refreshed when the source changes.
+
+The cache belongs to the work session, not to the document:
 
 - normalized working copy path
 - source hash for reuse decisions
 - current published version path for `publish-next`
 
-Do not embed session state into the `.docx` package just to accelerate the workflow.
+Do not embed either type of session state into the `.docx` package.
 
 ## Protected / IRM workflow rule
 
 If the source is not a true OOXML zip package:
 
-1. stage it in `C:\Temp`
+1. stage it in `.wordflow/` adjacent to the source
 2. use Word only for conversion
 3. export plain text from source
 4. convert through `Word -> RTF -> OOXML`
 5. export plain text from migrated candidate
 6. export Word-observed paragraph signatures from source and migrated candidate
-7. require those text exports to match
-8. require the Word-observed paragraph signatures to preserve inherited formatting that should survive conversion
-9. validate the migrated OOXML
-10. if available, compare fidelity against a trusted OOXML reference
-11. only then trust the migrated file as a candidate technical base
+7. **capture protection metadata** (`ProtectionType`, `HasPassword`, IRM status) while the document is open in Word
+8. require those text exports to match
+9. require the Word-observed paragraph signatures to preserve inherited formatting that should survive conversion
+10. validate the migrated OOXML
+11. if available, compare fidelity against a trusted OOXML reference
+12. only then trust the migrated file as a candidate technical base
 
 Do not run OpenXML editing directly against a protected container.
 
+## Protection round-trip rule
+
+When the source required Word COM to open (encrypted or protection-restricted), the workflow must offer a way to re-apply the original protection after N editing iterations.
+
+Protection metadata is captured once during `prepare-session` and stored in `.wordflow/sessions/<id>/protection.json`. It is never re-captured during editing iterations.
+
+Re-protection rules:
+
+- `protect` must use the `current_version_path` from session metadata — never require the caller to specify `--input`
+- if the original had a password, `--password` is required; fail with a clear error if omitted
+- if the original had only editing restrictions (no encryption), `--password` is optional
+- if the original had IRM, attempt re-application through Word COM; document in the error if the RMS service is unreachable
+- `protect` is Windows-only — it must never be called from a Linux/macOS environment
+
 ## Build and test rules
 
-Use:
+The 64 unit tests cover the cross-platform surface (OOXML editing, validation, sessions, publish workflows). They run on any OS:
+
+```bash
+cargo test
+```
+
+On Windows with the MSVC toolchain:
 
 ```powershell
 cargo +stable-x86_64-pc-windows-msvc test
 ```
 
-Cargo should already be configured to place `target` output under `C:\Temp\wordflow-target`.
-
-If a caller must override that location explicitly:
-
-```powershell
-$env:CARGO_TARGET_DIR = 'C:\Temp\wordflow-target'
-cargo +stable-x86_64-pc-windows-msvc test
-```
+The `migrate` command and `--allow-word-com-encrypted-package` require Windows with Word installed and are not covered by the unit test suite.
 
 When adding or changing workflow behavior:
 
-1. add or update tests
+1. add or update tests in `src/lib.rs` or `src/session.rs`
 2. rerun the crate tests
-3. update `README.md`
-4. update this file if workflow expectations changed
+3. update `README.md` — feature support matrix, command descriptions, and runtime workspace docs
+4. update this file if engineering contracts or maintenance rules changed
 
 ## Change rules
 

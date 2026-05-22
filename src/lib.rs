@@ -69,9 +69,27 @@ const HEADER_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
 const FOOTER_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml";
-const DEFAULT_TEMP_ROOT: &str = r"C:\Temp\wordflow";
 const SESSION_METADATA_FILE: &str = "session.json";
 const SESSION_WORKING_DOCX_FILE: &str = "working-normalized.docx";
+const SESSION_PROTECTION_FILE: &str = "protection.json";
+
+fn default_temp_root(input_hint: Option<&Path>) -> PathBuf {
+    input_hint
+        .and_then(|p| p.parent())
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|dir| dir.join(".wordflow"))
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".wordflow")
+        })
+}
+
+fn resolve_temp_root(temp_root: Option<&Path>, input_hint: Option<&Path>) -> PathBuf {
+    temp_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_temp_root(input_hint))
+}
 const SUPPORTED_HIGHLIGHTS: &[&str] = &[
     "black",
     "blue",
@@ -144,6 +162,7 @@ pub struct NormalizeWorkflowReport {
     pub already_normalized: bool,
     pub xml_parts_checked: usize,
     pub published_output: PathBuf,
+    pub protection: Option<ProtectionMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +223,7 @@ pub struct WorkSessionReport {
     pub normalized_input: PathBuf,
     pub detected_format: DocumentFormat,
     pub cache_hit: bool,
+    pub protection: Option<ProtectionMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,12 +252,47 @@ pub struct CommentUpdate {
     pub highlight: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtectionMetadata {
+    pub protection_type: i32,
+    pub has_password: bool,
+    pub irm_enabled: bool,
+    pub irm_url: Option<String>,
+}
+
+impl ProtectionMetadata {
+    pub fn is_protected(&self) -> bool {
+        self.protection_type != -1 || self.irm_enabled
+    }
+
+    pub fn requires_password(&self) -> bool {
+        self.has_password
+    }
+
+    pub fn protection_type_name(&self) -> &'static str {
+        match self.protection_type {
+            1 => "comments-only",
+            2 => "forms-only",
+            3 => "tracked-changes-only",
+            4 => "read-only",
+            _ => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProtectWorkflowReport {
+    pub protected_output: PathBuf,
+    pub protection_type_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct MigrationWorkflowReport {
     pub xml_parts_checked: usize,
     pub published_output: PathBuf,
     pub text_exports_match: bool,
     pub word_fidelity_match: bool,
+    pub protection: Option<ProtectionMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -913,6 +968,10 @@ fn session_metadata_path(temp_root: &Path, session_id: &str) -> PathBuf {
     session_dir(temp_root, session_id).join(SESSION_METADATA_FILE)
 }
 
+fn session_protection_path(temp_root: &Path, session_id: &str) -> PathBuf {
+    session_dir(temp_root, session_id).join(SESSION_PROTECTION_FILE)
+}
+
 fn load_work_session_metadata(temp_root: &Path, session_id: &str) -> Result<WorkSessionMetadata> {
     let metadata_path = session_metadata_path(temp_root, session_id);
     let raw = fs::read_to_string(&metadata_path)
@@ -1082,9 +1141,11 @@ pub fn normalize_docx_file(
 ) -> Result<NormalizeWorkflowReport> {
     let bytes = fs::read(input).with_context(|| format!("failed to read {}", input.display()))?;
     let normalization = inspect_normalization_bytes(&bytes);
+    tracing::info!(format = normalization.format.as_str(), "document format detected");
 
     match normalization.format {
         DocumentFormat::OoxmlZip => {
+            tracing::info!("source is already normalized OOXML — copying directly");
             let report = validate_docx_bytes(&bytes)?;
             if !report.is_valid() {
                 bail!(
@@ -1112,15 +1173,18 @@ pub fn normalize_docx_file(
                 already_normalized: true,
                 xml_parts_checked: report.xml_parts_checked,
                 published_output: output.to_path_buf(),
+                protection: None,
             })
         }
         DocumentFormat::OleEncryptedPackage if allow_word_com_encrypted_package => {
+            tracing::info!("normalizing encrypted source via Word COM fallback");
             let report = migrate_source_to_ooxml(input, output, temp_root, trusted_ooxml)?;
             Ok(NormalizeWorkflowReport {
                 detected_format: normalization.format,
                 already_normalized: false,
                 xml_parts_checked: report.xml_parts_checked,
                 published_output: report.published_output,
+                protection: report.protection,
             })
         }
         _ => {
@@ -1147,6 +1211,7 @@ pub fn add_comment_to_docx(
     anchor: &AnchorTarget,
     comment: &CommentSpec,
 ) -> Result<()> {
+    tracing::info!("adding comment to document");
     let spec = AutomationSpec {
         operations: vec![Operation::InsertCommentAfter {
             part: PartTarget(part.map(|value| value.to_string())),
@@ -1171,6 +1236,7 @@ pub fn update_docx_comment(
     comment_id: u32,
     update: &CommentUpdate,
 ) -> Result<()> {
+    tracing::info!(id = comment_id, "updating comment");
     let input_bytes =
         fs::read(input).with_context(|| format!("failed to read {}", input.display()))?;
     ensure_input_is_normalized(input, &input_bytes)?;
@@ -1220,6 +1286,7 @@ pub fn update_docx_comment(
 }
 
 pub fn delete_docx_comment(input: &Path, output: &Path, comment_id: u32) -> Result<()> {
+    tracing::info!(id = comment_id, "deleting comment");
     let input_bytes =
         fs::read(input).with_context(|| format!("failed to read {}", input.display()))?;
     ensure_input_is_normalized(input, &input_bytes)?;
@@ -1332,7 +1399,9 @@ fn publish_spec_file_to_docx_internal(
         );
     }
 
-    let temp_dir = create_work_dir(temp_root.unwrap_or(Path::new(DEFAULT_TEMP_ROOT)))?;
+    tracing::info!(input = %input.display(), output = %output.display(), "publish workflow started");
+
+    let temp_dir = create_work_dir(&resolve_temp_root(temp_root, Some(input)))?;
     let staged_input = temp_dir.join("source.docx");
     let candidate_output = temp_dir.join("candidate.docx");
 
@@ -1345,6 +1414,7 @@ fn publish_spec_file_to_docx_internal(
                 staged_input.display()
             )
         })?;
+        tracing::debug!("source staged to temp workspace");
 
         let source_bytes = fs::read(&staged_input)
             .with_context(|| format!("failed to read staged source {}", staged_input.display()))?;
@@ -1354,6 +1424,7 @@ fn publish_spec_file_to_docx_internal(
             spec,
             spec_base_dir,
         )?;
+        tracing::debug!(parts = candidate_validation.xml_parts_checked, "candidate validated");
         fs::write(&candidate_output, &output_bytes).with_context(|| {
             format!(
                 "failed to write temporary candidate output {}",
@@ -1377,6 +1448,7 @@ fn publish_spec_file_to_docx_internal(
                 output.display()
             )
         })?;
+        tracing::info!(output = %output.display(), "output published");
         verify_published_output_matches_candidate(output, &output_bytes)?;
 
         Ok(PublishWorkflowReport {
@@ -1388,12 +1460,16 @@ fn publish_spec_file_to_docx_internal(
     match workflow {
         Ok(report) => {
             cleanup_temp_dir(&temp_dir)?;
+            tracing::debug!("temp workspace cleaned up");
             Ok(report)
         }
-        Err(err) => Err(err.context(format!(
-            "publish workflow aborted; temporary workspace preserved at {}",
-            temp_dir.display()
-        ))),
+        Err(err) => {
+            tracing::warn!(temp_dir = %temp_dir.display(), "publish failed — temp workspace preserved for debugging");
+            Err(err.context(format!(
+                "publish workflow aborted; temporary workspace preserved at {}",
+                temp_dir.display()
+            )))
+        }
     }
 }
 
@@ -1420,7 +1496,9 @@ pub fn migrate_source_to_ooxml(
         );
     }
 
-    let temp_dir = create_work_dir(temp_root.unwrap_or(Path::new(r"C:\Temp\wordflow")))?;
+    tracing::info!(input = %input.display(), "migration workflow started");
+
+    let temp_dir = create_work_dir(&resolve_temp_root(temp_root, Some(input)))?;
     let staged_input = temp_dir.join("source-input.docx");
     let source_export = temp_dir.join("source-export.txt");
     let source_signatures = temp_dir.join("source-signatures.json");
@@ -1429,6 +1507,7 @@ pub fn migrate_source_to_ooxml(
     let migrated_export = temp_dir.join("migrated-export.txt");
     let migrated_signatures = temp_dir.join("migrated-signatures.json");
     let script_path = temp_dir.join("run-migration.ps1");
+    let protection_metadata = temp_dir.join("protection.json");
 
     let workflow = (|| -> Result<MigrationWorkflowReport> {
         fs::copy(input, &staged_input).with_context(|| {
@@ -1438,6 +1517,7 @@ pub fn migrate_source_to_ooxml(
                 staged_input.display()
             )
         })?;
+        tracing::debug!("source staged");
 
         write_word_migration_script(
             &script_path,
@@ -1448,8 +1528,19 @@ pub fn migrate_source_to_ooxml(
             &migrated_output,
             &migrated_export,
             &migrated_signatures,
+            &protection_metadata,
         )?;
+        tracing::info!("running Word migration script via PowerShell");
         run_powershell_file(&script_path)?;
+        tracing::debug!("PowerShell migration script completed");
+
+        let protection = if protection_metadata.exists() {
+            fs::read_to_string(&protection_metadata)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<ProtectionMetadata>(&raw).ok())
+        } else {
+            None
+        };
 
         let source_text = fs::read(&source_export).with_context(|| {
             format!("failed to read source text export {}", source_export.display())
@@ -1486,6 +1577,7 @@ pub fn migrate_source_to_ooxml(
                 format_validation_issues(&candidate_validation.issues)
             );
         }
+        tracing::debug!(parts = candidate_validation.xml_parts_checked, "migrated candidate validated");
 
         if let Some(reference) = trusted_ooxml {
             let fidelity = validate_source_fidelity_file(reference, &migrated_output, None)?;
@@ -1513,6 +1605,7 @@ pub fn migrate_source_to_ooxml(
                 output.display()
             )
         })?;
+        tracing::info!(output = %output.display(), "migrated document published");
         let migrated_bytes = fs::read(&migrated_output).with_context(|| {
             format!("failed to read validated migrated candidate {}", migrated_output.display())
         })?;
@@ -1523,6 +1616,7 @@ pub fn migrate_source_to_ooxml(
             published_output: output.to_path_buf(),
             text_exports_match: true,
             word_fidelity_match: true,
+            protection,
         })
     })();
 
@@ -1612,6 +1706,7 @@ pub fn find_anchors_in_docx(
             }
         }
     }
+    tracing::debug!(found = matches.len(), "anchor search complete");
     Ok(matches)
 }
 
@@ -1785,6 +1880,7 @@ pub fn validate_docx_bytes(input_bytes: &[u8]) -> Result<ValidationReport> {
         }
     }
 
+    tracing::debug!(parts = xml_parts_checked, valid = issues.is_empty(), "OOXML validation complete");
     Ok(ValidationReport {
         xml_parts_checked,
         issues,
@@ -1825,6 +1921,7 @@ pub fn diff_docx_files(before: &Path, after: &Path) -> Result<DiffSummary> {
     removed_parts.sort();
     changed_parts.sort();
 
+    tracing::debug!(added = added_parts.len(), removed = removed_parts.len(), changed = changed_parts.len(), "diff complete");
     Ok(DiffSummary {
         added_parts,
         removed_parts,
@@ -1874,6 +1971,7 @@ fn write_word_migration_script(
     migrated_output: &Path,
     migrated_export: &Path,
     migrated_signatures: &Path,
+    protection_metadata_path: &Path,
 ) -> Result<()> {
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
@@ -1921,6 +2019,27 @@ $word = New-Object -ComObject Word.Application
 $word.Visible = $false
 try {{
   $doc = $word.Documents.Open({staged_input}, $false, $true)
+  $protType = -1
+  $hasPwd = $false
+  $irmEnabled = $false
+  $irmUrl = $null
+  try {{
+    $protType = [int]$doc.ProtectionType
+    $hasPwd = [bool]$doc.HasPassword
+    if ($null -ne $doc.Permission) {{
+      $irmEnabled = [bool]$doc.Permission.Enabled
+      if ($irmEnabled) {{
+        try {{ $irmUrl = $doc.Permission.RequestPermissionURL }} catch {{ $irmUrl = $null }}
+      }}
+    }}
+  }} catch {{}}
+  $protData = [pscustomobject]@{{
+    protection_type = $protType
+    has_password    = $hasPwd
+    irm_enabled     = $irmEnabled
+    irm_url         = $irmUrl
+  }}
+  $protData | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath {protection_metadata_path}
   $doc.SaveAs2({source_export}, 2)
   $sourceSignatures = Get-ParagraphSignatureObjects $doc
   $doc.Close()
@@ -1952,6 +2071,7 @@ $migratedSignatures | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath {migrat
         migrated_output = ps_single_quoted(migrated_output),
         migrated_export = ps_single_quoted(migrated_export),
         migrated_signatures = ps_single_quoted(migrated_signatures),
+        protection_metadata_path = ps_single_quoted(protection_metadata_path),
     );
 
     fs::write(script_path, script)
@@ -1960,6 +2080,131 @@ $migratedSignatures | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath {migrat
 
 fn ps_single_quoted(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+fn ps_quoted_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn write_word_protect_script(
+    script_path: &Path,
+    input: &Path,
+    output: &Path,
+    protection: &ProtectionMetadata,
+    password: Option<&str>,
+) -> Result<()> {
+    let restrict_block = if protection.protection_type != -1 {
+        let pwd_arg = password
+            .map(|p| format!(", $false, {}", ps_quoted_string(p)))
+            .unwrap_or_else(|| ", $false, ''".to_string());
+        format!(
+            "  $doc.Protect({protection_type}{pwd_arg}) | Out-Null",
+            protection_type = protection.protection_type,
+        )
+    } else {
+        String::new()
+    };
+
+    let save_block = if protection.has_password {
+        let pwd = password.unwrap_or("");
+        format!(
+            "  $doc.SaveAs2({output}, 16, $false, {pwd})",
+            output = ps_single_quoted(output),
+            pwd = ps_quoted_string(pwd),
+        )
+    } else {
+        format!(
+            "  $doc.SaveAs2({output}, 16)",
+            output = ps_single_quoted(output),
+        )
+    };
+
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+try {{
+  $doc = $word.Documents.Open({input}, $false, $false)
+{restrict_block}
+{save_block}
+  $doc.Close()
+}} finally {{
+  $word.Quit()
+  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
+}}"#,
+        input = ps_single_quoted(input),
+    );
+
+    fs::write(script_path, script)
+        .with_context(|| format!("failed to write protect script {}", script_path.display()))
+}
+
+pub fn protect_document_from_session(
+    session_id: &str,
+    output: &Path,
+    password: Option<&str>,
+    temp_root: Option<&Path>,
+) -> Result<ProtectWorkflowReport> {
+    ensure_session_id_is_safe(session_id)?;
+    let temp_root_buf = resolve_temp_root(temp_root, None);
+    let temp_root = temp_root_buf.as_path();
+
+    let metadata = load_work_session_metadata(temp_root, session_id)?;
+    let input = PathBuf::from(&metadata.current_version_path);
+
+    let protection_path = session_protection_path(temp_root, session_id);
+    if !protection_path.exists() {
+        bail!(
+            "no protection metadata found for session '{}' — only sessions created from encrypted or protected sources support re-protection",
+            session_id
+        );
+    }
+    let raw = fs::read_to_string(&protection_path)
+        .with_context(|| format!("failed to read protection metadata {}", protection_path.display()))?;
+    let protection: ProtectionMetadata = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse protection metadata {}", protection_path.display()))?;
+
+    if !protection.is_protected() {
+        bail!("the original document had no protection — re-protection is not needed");
+    }
+    if protection.requires_password() && password.is_none() {
+        bail!(
+            "the original document was password-protected — provide --password to re-apply encryption"
+        );
+    }
+
+    tracing::info!(session = session_id, input = %input.display(), "protect workflow started");
+
+    let temp_dir = create_work_dir(temp_root)?;
+
+    let workflow = (|| -> Result<ProtectWorkflowReport> {
+        let script_path = temp_dir.join("run-protect.ps1");
+        if let Some(parent) = output.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+        }
+        write_word_protect_script(&script_path, &input, output, &protection, password)?;
+        tracing::info!("running Word protection script via PowerShell");
+        run_powershell_file(&script_path)?;
+        tracing::info!(output = %output.display(), protection = protection.protection_type_name(), "document protected");
+        Ok(ProtectWorkflowReport {
+            protected_output: output.to_path_buf(),
+            protection_type_name: protection.protection_type_name().to_string(),
+        })
+    })();
+
+    match workflow {
+        Ok(report) => {
+            cleanup_temp_dir(&temp_dir)?;
+            Ok(report)
+        }
+        Err(err) => Err(err.context(format!(
+            "protect workflow aborted; temporary workspace preserved at {}",
+            temp_dir.display()
+        ))),
+    }
 }
 
 fn run_powershell_file(script_path: &Path) -> Result<()> {
@@ -2066,6 +2311,7 @@ pub fn apply_spec_to_docx_bytes(
     spec_base_dir: &Path,
 ) -> Result<Vec<u8>> {
     spec.validate(spec_base_dir)?;
+    tracing::info!(operations = spec.operations.len(), "applying spec");
     if can_use_raw_document_insert_path(spec)? {
         return apply_raw_document_insert_path(input_bytes, spec, spec_base_dir);
     }
@@ -2666,7 +2912,9 @@ pub fn prepare_work_session(
     allow_word_com_encrypted_package: bool,
 ) -> Result<WorkSessionReport> {
     ensure_session_id_is_safe(session_id)?;
-    let temp_root = temp_root.unwrap_or(Path::new(DEFAULT_TEMP_ROOT));
+    tracing::info!(session = session_id, "preparing work session");
+    let temp_root_buf = resolve_temp_root(temp_root, Some(input));
+    let temp_root = temp_root_buf.as_path();
     let session_dir = session_dir(temp_root, session_id);
     fs::create_dir_all(&session_dir)
         .with_context(|| format!("failed to create session dir {}", session_dir.display()))?;
@@ -2680,12 +2928,14 @@ pub fn prepare_work_session(
         && metadata.source_sha256 == source_sha256
         && Path::new(&metadata.normalized_path).exists()
     {
+        tracing::info!(session = session_id, "cache hit — reusing existing normalized copy");
         return Ok(WorkSessionReport {
             session_id: session_id.to_string(),
             session_dir,
             normalized_input: PathBuf::from(metadata.normalized_path),
             detected_format: metadata.detected_format,
             cache_hit: true,
+            protection: None,
         });
     }
 
@@ -2710,6 +2960,15 @@ pub fn prepare_work_session(
         detected_format: normalization.detected_format,
     };
     save_work_session_metadata(temp_root, &metadata)?;
+    if let Some(ref prot) = normalization.protection {
+        let prot_path = session_protection_path(temp_root, session_id);
+        let prot_json = serde_json::to_string_pretty(prot)
+            .context("failed to serialize protection metadata")?;
+        fs::write(&prot_path, prot_json)
+            .with_context(|| format!("failed to write protection metadata {}", prot_path.display()))?;
+        tracing::info!(session = session_id, protection_type = prot.protection_type_name(), "protection metadata saved");
+    }
+    tracing::info!(session = session_id, normalized = %normalized_path.display(), "session ready");
 
     Ok(WorkSessionReport {
         session_id: session_id.to_string(),
@@ -2717,6 +2976,7 @@ pub fn prepare_work_session(
         normalized_input: normalized_path,
         detected_format: normalization.detected_format,
         cache_hit: false,
+        protection: normalization.protection,
     })
 }
 
@@ -2754,7 +3014,9 @@ pub fn publish_session_to_next_version(
     mode: PublishTargetMode,
 ) -> Result<PublishNextWorkflowReport> {
     ensure_session_id_is_safe(session_id)?;
-    let temp_root = temp_root.unwrap_or(Path::new(DEFAULT_TEMP_ROOT));
+    tracing::info!(session = session_id, "publishing from work session");
+    let temp_root_buf = resolve_temp_root(temp_root, None);
+    let temp_root = temp_root_buf.as_path();
     let mut metadata = load_work_session_metadata(temp_root, session_id)?;
     let working_input = PathBuf::from(&metadata.normalized_path);
     let source_bytes = fs::read(&working_input)
@@ -2780,6 +3042,7 @@ pub fn publish_session_to_next_version(
     ensure_existing_output_is_safe_for_direct_write(&resolved_output)?;
     fs::write(&resolved_output, &output_bytes)
         .with_context(|| format!("failed to publish {}", resolved_output.display()))?;
+    tracing::info!(output = %resolved_output.display(), version = version_number, "session published");
     verify_published_output_matches_candidate(&resolved_output, &output_bytes)?;
     fs::write(&working_input, &output_bytes).with_context(|| {
         format!(
@@ -5723,6 +5986,442 @@ mod tests {
             .expect("read document");
         assert!(!document.contains("commentRangeStart"));
         assert!(!document.contains("commentReference"));
+    }
+
+    #[test]
+    fn default_temp_root_derives_from_input_parent() {
+        let input = Path::new("/some/dir/document.docx");
+        assert_eq!(default_temp_root(Some(input)), PathBuf::from("/some/dir/.wordflow"));
+    }
+
+    #[test]
+    fn default_temp_root_falls_back_to_current_dir_when_no_input() {
+        let root = default_temp_root(None);
+        assert_eq!(root, std::env::current_dir().unwrap().join(".wordflow"));
+    }
+
+    #[test]
+    fn default_temp_root_falls_back_to_current_dir_when_input_has_no_parent() {
+        let root = default_temp_root(Some(Path::new("document.docx")));
+        assert_eq!(root, std::env::current_dir().unwrap().join(".wordflow"));
+    }
+
+    #[test]
+    fn resolve_temp_root_uses_provided_path_over_input() {
+        let provided = Path::new("/custom/path");
+        let input = Path::new("/docs/report.docx");
+        assert_eq!(
+            resolve_temp_root(Some(provided), Some(input)),
+            PathBuf::from("/custom/path")
+        );
+    }
+
+    #[test]
+    fn resolve_temp_root_derives_from_input_when_not_provided() {
+        let input = Path::new("/docs/report.docx");
+        assert_eq!(
+            resolve_temp_root(None, Some(input)),
+            PathBuf::from("/docs/.wordflow")
+        );
+    }
+
+    #[test]
+    fn resolve_temp_root_falls_back_to_current_dir_without_input() {
+        let root = resolve_temp_root(None, None);
+        assert_eq!(root, std::env::current_dir().unwrap().join(".wordflow"));
+    }
+
+    #[test]
+    fn anchor_matches_all_modes() {
+        let make = |mode, text: &str| AnchorSpec {
+            text: text.to_string(),
+            mode,
+            occurrence: 1,
+        };
+        assert!(anchor_matches("Hello World", &make(AnchorMatchMode::Contains, "World")));
+        assert!(!anchor_matches("Hello World", &make(AnchorMatchMode::Contains, "earth")));
+        assert!(anchor_matches("Hello World", &make(AnchorMatchMode::Equals, "Hello World")));
+        assert!(!anchor_matches("Hello World", &make(AnchorMatchMode::Equals, "World")));
+        assert!(anchor_matches("Hello World", &make(AnchorMatchMode::StartsWith, "Hello")));
+        assert!(!anchor_matches("Hello World", &make(AnchorMatchMode::StartsWith, "World")));
+        assert!(anchor_matches("Hello World", &make(AnchorMatchMode::EndsWith, "World")));
+        assert!(!anchor_matches("Hello World", &make(AnchorMatchMode::EndsWith, "Hello")));
+    }
+
+    #[test]
+    fn parse_versioned_stem_extracts_prefix_number_and_width() {
+        let (prefix, number, width) = parse_versioned_stem(Path::new("report-v007.docx")).unwrap();
+        assert_eq!(prefix, "report-");
+        assert_eq!(number, 7);
+        assert_eq!(width, 3);
+
+        let (prefix, number, width) = parse_versioned_stem(Path::new("doc-v1.docx")).unwrap();
+        assert_eq!(prefix, "doc-");
+        assert_eq!(number, 1);
+        assert_eq!(width, 1);
+    }
+
+    #[test]
+    fn parse_versioned_stem_rejects_path_without_version() {
+        let err = parse_versioned_stem(Path::new("doc.docx")).unwrap_err();
+        assert!(err.to_string().contains("does not end with a version marker"), "{err}");
+    }
+
+    #[test]
+    fn ensure_session_id_is_safe_accepts_valid_ids() {
+        ensure_session_id_is_safe("valid-session-id").expect("dashes ok");
+        ensure_session_id_is_safe("session_123").expect("underscores ok");
+        ensure_session_id_is_safe("session.1").expect("dots ok");
+        ensure_session_id_is_safe("ABC123").expect("alphanumeric ok");
+    }
+
+    #[test]
+    fn ensure_session_id_is_safe_rejects_invalid_ids() {
+        ensure_session_id_is_safe("  ").expect_err("whitespace-only should fail");
+        ensure_session_id_is_safe("id with spaces").expect_err("spaces should fail");
+        ensure_session_id_is_safe("id/path").expect_err("slash should fail");
+        ensure_session_id_is_safe("").expect_err("empty should fail");
+    }
+
+    #[test]
+    fn detect_document_format_recognizes_all_formats() {
+        assert_eq!(detect_document_format(&ZIP_HEADER), DocumentFormat::OoxmlZip);
+
+        let mut bytes = OLE_HEADER.to_vec();
+        bytes.extend_from_slice(&utf16le_bytes("EncryptedPackage"));
+        assert_eq!(detect_document_format(&bytes), DocumentFormat::OleEncryptedPackage);
+
+        let mut bytes = OLE_HEADER.to_vec();
+        bytes.extend_from_slice(&utf16le_bytes("WordDocument"));
+        assert_eq!(detect_document_format(&bytes), DocumentFormat::OleWordBinary);
+
+        assert_eq!(detect_document_format(&OLE_HEADER), DocumentFormat::OleCompound);
+
+        assert_eq!(detect_document_format(b"not a docx"), DocumentFormat::Unknown);
+    }
+
+    #[test]
+    fn validate_docx_bytes_reports_missing_document_xml() {
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut out);
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            writer.start_file(CONTENT_TYPES_XML_PATH, options).unwrap();
+            writer.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#).unwrap();
+            writer.finish().unwrap();
+        }
+        let bytes = out.into_inner();
+        let report = validate_docx_bytes(&bytes).expect("validate should return report");
+        assert!(!report.is_valid());
+        assert!(report.issues.iter().any(|i| i.contains("word/document.xml")), "{:?}", report.issues);
+    }
+
+    #[test]
+    fn validate_docx_bytes_reports_invalid_xml() {
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut out);
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            writer.start_file(CONTENT_TYPES_XML_PATH, options).unwrap();
+            writer.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#).unwrap();
+            writer.add_directory("word/", options).unwrap();
+            writer.start_file(DOCUMENT_XML_PATH, options).unwrap();
+            writer.write_all(b"<not valid xml").unwrap();
+            writer.finish().unwrap();
+        }
+        let bytes = out.into_inner();
+        let report = validate_docx_bytes(&bytes).expect("validate should return report");
+        assert!(!report.is_valid(), "report should flag invalid xml: {:?}", report.issues);
+    }
+
+    #[test]
+    fn spec_validation_rejects_empty_operations() {
+        let spec = AutomationSpec { operations: vec![] };
+        let err = spec.validate(Path::new(".")).expect_err("empty operations should fail");
+        assert!(err.to_string().contains("at least one operation"), "{err}");
+    }
+
+    #[test]
+    fn spec_validation_rejects_zero_occurrence() {
+        let spec = AutomationSpec {
+            operations: vec![Operation::InsertParagraphs {
+                part: PartTarget::default(),
+                anchor: AnchorTarget::Structured(AnchorSpec {
+                    text: "Anchor".to_string(),
+                    mode: AnchorMatchMode::Contains,
+                    occurrence: 0,
+                }),
+                entries: vec![ParagraphEntry {
+                    text: "text".to_string(),
+                    style: ParagraphStyle::Normal,
+                    highlight: "green".to_string(),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                }],
+            }],
+        };
+        let err = spec.validate(Path::new(".")).expect_err("zero occurrence should fail");
+        assert!(err.to_string().contains("occurrence must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn spec_validation_rejects_empty_anchor_text() {
+        let spec = AutomationSpec {
+            operations: vec![Operation::InsertParagraphs {
+                part: PartTarget::default(),
+                anchor: AnchorTarget::Structured(AnchorSpec {
+                    text: "".to_string(),
+                    mode: AnchorMatchMode::Contains,
+                    occurrence: 1,
+                }),
+                entries: vec![ParagraphEntry {
+                    text: "text".to_string(),
+                    style: ParagraphStyle::Normal,
+                    highlight: "green".to_string(),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                }],
+            }],
+        };
+        let err = spec.validate(Path::new(".")).expect_err("empty anchor should fail");
+        assert!(err.to_string().contains("anchor text must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn spec_validation_rejects_empty_entries_list() {
+        let spec = AutomationSpec {
+            operations: vec![Operation::InsertParagraphs {
+                part: PartTarget::default(),
+                anchor: AnchorTarget::Simple("Anchor".to_string()),
+                entries: vec![],
+            }],
+        };
+        let err = spec.validate(Path::new(".")).expect_err("empty entries should fail");
+        assert!(err.to_string().contains("at least one entry"), "{err}");
+    }
+
+    #[test]
+    fn apply_spec_returns_descriptive_error_when_anchor_not_found() {
+        let spec = AutomationSpec {
+            operations: vec![Operation::InsertParagraphs {
+                part: PartTarget::default(),
+                anchor: AnchorTarget::Simple("nonexistent anchor xyz".to_string()),
+                entries: vec![ParagraphEntry {
+                    text: "text".to_string(),
+                    style: ParagraphStyle::Normal,
+                    highlight: "green".to_string(),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                }],
+            }],
+        };
+        let err = apply_spec_to_docx_bytes(
+            &make_minimal_docx().expect("docx"),
+            &spec,
+            Path::new("."),
+        )
+        .expect_err("missing anchor should fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("anchor not found"), "{msg}");
+        assert!(msg.contains("nonexistent anchor xyz"), "{msg}");
+    }
+
+    #[test]
+    fn list_docx_parts_returns_all_entries() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("test.docx");
+        fs::write(&path, make_minimal_docx().expect("docx")).expect("write");
+        let parts = list_docx_parts(&path).expect("list parts");
+        assert!(parts.iter().any(|p| p.name == DOCUMENT_XML_PATH));
+        assert!(parts.iter().any(|p| p.name == CONTENT_TYPES_XML_PATH));
+        let doc = parts.iter().find(|p| p.name == DOCUMENT_XML_PATH).unwrap();
+        assert!(!doc.is_dir);
+        assert!(doc.size > 0);
+        assert!(doc.sha256.is_some());
+    }
+
+    #[test]
+    fn update_comment_errors_when_comment_not_found() {
+        let dir = tempdir().expect("temp dir");
+        let input_path = dir.path().join("commented.docx");
+        let output_path = dir.path().join("output.docx");
+
+        let spec = AutomationSpec {
+            operations: vec![Operation::InsertCommentAfter {
+                part: PartTarget::default(),
+                anchor: AnchorTarget::Simple("Strategic principles".to_string()),
+                comment: CommentSpec {
+                    text: "anchor text".to_string(),
+                    comment_text: "review note".to_string(),
+                    author: "Author".to_string(),
+                    initials: None,
+                    date: None,
+                    style: ParagraphStyle::Normal,
+                    highlight: "green".to_string(),
+                },
+            }],
+        };
+        let commented = apply_spec_to_docx_bytes(
+            &make_minimal_docx().expect("docx"),
+            &spec,
+            Path::new("."),
+        )
+        .expect("add comment");
+        fs::write(&input_path, commented).expect("write commented docx");
+
+        let err = update_docx_comment(
+            &input_path,
+            &output_path,
+            999,
+            &CommentUpdate {
+                comment_text: Some("updated".to_string()),
+                ..CommentUpdate::default()
+            },
+        )
+        .expect_err("should fail for nonexistent comment");
+        assert!(err.to_string().contains("comment not found"), "{err}");
+    }
+
+    #[test]
+    fn delete_comment_errors_when_comment_not_found() {
+        let dir = tempdir().expect("temp dir");
+        let input_path = dir.path().join("commented.docx");
+        let output_path = dir.path().join("output.docx");
+
+        let spec = AutomationSpec {
+            operations: vec![Operation::InsertCommentAfter {
+                part: PartTarget::default(),
+                anchor: AnchorTarget::Simple("Strategic principles".to_string()),
+                comment: CommentSpec {
+                    text: "anchor text".to_string(),
+                    comment_text: "review note".to_string(),
+                    author: "Author".to_string(),
+                    initials: None,
+                    date: None,
+                    style: ParagraphStyle::Normal,
+                    highlight: "green".to_string(),
+                },
+            }],
+        };
+        let commented = apply_spec_to_docx_bytes(
+            &make_minimal_docx().expect("docx"),
+            &spec,
+            Path::new("."),
+        )
+        .expect("add comment");
+        fs::write(&input_path, commented).expect("write commented docx");
+
+        let err = delete_docx_comment(&input_path, &output_path, 999)
+            .expect_err("should fail for nonexistent comment");
+        assert!(err.to_string().contains("comment not found"), "{err}");
+    }
+
+    #[test]
+    fn list_docx_comments_returns_empty_when_no_comments_part() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("no-comments.docx");
+        fs::write(&path, make_minimal_docx().expect("docx")).expect("write");
+        let comments = list_docx_comments(&path).expect("list comments");
+        assert!(comments.is_empty());
+    }
+
+    #[test]
+    fn protection_metadata_detects_protected_document() {
+        let meta = ProtectionMetadata {
+            protection_type: 3,
+            has_password: true,
+            irm_enabled: false,
+            irm_url: None,
+        };
+        assert!(meta.is_protected());
+        assert!(meta.requires_password());
+        assert_eq!(meta.protection_type_name(), "tracked-changes-only");
+    }
+
+    #[test]
+    fn protection_metadata_detects_unprotected_document() {
+        let meta = ProtectionMetadata {
+            protection_type: -1,
+            has_password: false,
+            irm_enabled: false,
+            irm_url: None,
+        };
+        assert!(!meta.is_protected());
+        assert!(!meta.requires_password());
+        assert_eq!(meta.protection_type_name(), "none");
+    }
+
+    #[test]
+    fn protection_metadata_irm_counts_as_protected() {
+        let meta = ProtectionMetadata {
+            protection_type: -1,
+            has_password: false,
+            irm_enabled: true,
+            irm_url: Some("https://rms.example.com/policy".to_string()),
+        };
+        assert!(meta.is_protected());
+    }
+
+    #[test]
+    fn protect_errors_when_no_protection_metadata_in_session() {
+        let dir = tempdir().expect("temp dir");
+        let input_path = dir.path().join("versioned-document-v007.docx");
+        let temp_root = dir.path().join("temp-root");
+        fs::write(&input_path, make_minimal_docx().expect("docx")).expect("write input");
+
+        prepare_work_session(&input_path, "plain-session", Some(&temp_root), None, false)
+            .expect("prepare session");
+
+        let output = dir.path().join("protected.docx");
+        let err = protect_document_from_session(
+            "plain-session",
+            &output,
+            None,
+            Some(&temp_root),
+        )
+        .expect_err("should fail without protection metadata");
+        assert!(
+            err.to_string().contains("no protection metadata found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn protect_errors_when_password_required_but_not_provided() {
+        let dir = tempdir().expect("temp dir");
+        let input_path = dir.path().join("versioned-document-v007.docx");
+        let temp_root = dir.path().join("temp-root");
+        fs::write(&input_path, make_minimal_docx().expect("docx")).expect("write input");
+
+        prepare_work_session(&input_path, "pwd-session", Some(&temp_root), None, false)
+            .expect("prepare session");
+
+        // Manually inject protection metadata into the session
+        let protection = ProtectionMetadata {
+            protection_type: 4,
+            has_password: true,
+            irm_enabled: false,
+            irm_url: None,
+        };
+        let prot_path = session_protection_path(&temp_root, "pwd-session");
+        fs::write(&prot_path, serde_json::to_string(&protection).unwrap())
+            .expect("write protection metadata");
+
+        let output = dir.path().join("protected.docx");
+        let err = protect_document_from_session(
+            "pwd-session",
+            &output,
+            None,
+            Some(&temp_root),
+        )
+        .expect_err("should fail without password");
+        assert!(
+            err.to_string().contains("provide --password"),
+            "{err}"
+        );
     }
 
     fn make_minimal_docx() -> Result<Vec<u8>> {

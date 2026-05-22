@@ -8,11 +8,11 @@ Reliable `.docx` automation through OpenXML, with a staged workflow for Word-sen
 
 - [The idea behind this](#the-idea-behind-this)
 - [What this solves in practice](#what-this-solves-in-practice)
+- [wordflow vs pandoc](#wordflow-vs-pandoc)
 - [Configuring agents to use wordflow](#configuring-agents-to-use-wordflow)
   - [Priority rule](#priority-rule)
-  - [Claude Code — `CLAUDE.md`](#claude-code-claudemd)
-  - [Qwen Code — `QWEN.md`](#qwen-code-qwenmd)
-  - [GitHub Copilot CLI — `.github/copilot-instructions.md`](#github-copilot-cli-githubcopilot-instructionsmd)
+  - [Base instruction block](#base-instruction-block)
+  - [Protected document block](#protected-document-block)
   - [System prompt pattern — any AI assistant](#system-prompt-pattern-any-ai-assistant)
   - [Agent skill definition pattern](#agent-skill-definition-pattern)
   - [What to tell the agent explicitly](#what-to-tell-the-agent-explicitly)
@@ -92,11 +92,45 @@ That sequence can be driven by a human, by an agent, or by both working together
 
 ---
 
+## wordflow vs pandoc
+
+### Purpose and approach
+
+| Dimension | wordflow | pandoc |
+|---|---|---|
+| **Purpose** | *Safe* automation of existing `.docx` files | Conversion between document *formats* |
+| **Approach** | Works on a real `.docx`: inserts, validates, reviews, publishes | Converts from A → B (markdown → docx, docx → pdf, etc.) |
+| **Pipeline** | normalize → validate → edit → check-fidelity → publish | input → transform → output |
+| **Fidelity** | Verifies the result preserves styles, structure, and comments | Does not verify fidelity — just produces a valid output |
+| **Protected documents** | Handles migration of protected sources, sessions, history | Assumes the source is directly convertible |
+| **Use cases** | Documents that evolve over multiple sessions with humans and agents | Format migration, one-shot document generation |
+| **Document state** | Maintains and updates the same document over time | Discards the source, produces a new file |
+| **Validation** | `check-fidelity`, `validate-spec`, `publish` with fail-fast | No post-conversion validation |
+| **Collaboration** | Sessions, change history, integrated comments | No concept of session or history |
+| **Tool type** | Workflow runner for living documents | Format converter |
+
+### Are they competitors? No — they are complementary.
+
+```
+pandoc   → converts any source into a normalized .docx
+wordflow → takes that .docx and edits, validates, and publishes it with guarantees
+```
+
+### Conceptual difference
+
+**pandoc** answers: *"How do I convert this file from format A to format B?"*
+
+**wordflow** answers: *"How do I safely, auditably, and reversibly modify this existing Word document?"*
+
+---
+
 ## Configuring agents to use wordflow
 
 When an agent needs to work with a Word document — to edit it, annotate it, insert a table, add review comments, or publish a new version — the default behavior is often to reach for a custom script, a PowerShell one-liner, or Word COM automation.
 
 This section explains how to configure an agent so that wordflow becomes the first tool it reaches for instead.
+
+The instruction blocks below are interchangeable across **Claude Code** (`CLAUDE.md`), **Qwen Code** (`QWEN.md`), and **GitHub Copilot CLI** (`.github/copilot-instructions.md`). Copy the same content into whichever file your agent reads.
 
 ### Priority rule
 
@@ -106,32 +140,9 @@ Word COM  →  allowed only for migration of protected or non-OOXML sources
 ad hoc scripts  →  not acceptable as a replacement for wordflow commands
 ```
 
-### Claude Code — `CLAUDE.md`
+### Base instruction block
 
-Add the following block to your project's `CLAUDE.md`:
-
-```markdown
-## Word document automation
-
-When working with `.docx` files, always use wordflow as the primary tool.
-
-Priority:
-1. Use wordflow CLI commands for all editing, review, commenting, validation, and publishing.
-2. Use Word COM only as a fallback for migration of non-OOXML or protected sources (migrate command).
-3. Do not write ad hoc PowerShell or Python scripts to manipulate .docx files directly.
-
-Before editing any document:
-- Run normalize to verify the source is a valid OOXML package.
-- Run validate-spec to check the spec before applying it.
-- Use publish instead of insert for final outputs.
-
-Executable: cargo +stable-x86_64-pc-windows-msvc run --
-Spec examples: .\examples\document-update.json, .\examples\review-comments.json
-```
-
-### Qwen Code — `QWEN.md`
-
-Add the following block to your project's `QWEN.md`:
+Add the following to your agent instruction file (`CLAUDE.md`, `QWEN.md`, or `.github/copilot-instructions.md`):
 
 ```markdown
 ## Word document automation
@@ -152,27 +163,29 @@ Executable: cargo +stable-x86_64-pc-windows-msvc run --
 Spec examples: .\examples\document-update.json, .\examples\review-comments.json
 ```
 
-### GitHub Copilot CLI — `.github/copilot-instructions.md`
+### Protected document block
 
-Create or update `.github/copilot-instructions.md` in your repository:
+Add this block alongside the base instruction when working with protected or encrypted documents:
 
 ```markdown
-## Word document automation
+## Protected documents
 
-When working with .docx files, always use wordflow as the primary tool.
+When prepare-session reports a Protection line in its output:
+1. If the output also shows PasswordRequired  true, ask the user for the
+   password before running protect. Keep it in conversation context —
+   do not ask again in the same session.
+2. Run protect as the last step, after the final publish-next.
+3. Report the name and location of the protected file delivered.
+4. Do not mention the protect command to the user — just deliver the result.
 
-Priority:
-1. Use wordflow CLI commands for all editing, review, commenting, validation, and publishing.
-2. Use Word COM only as a fallback for migration of non-OOXML or protected sources (migrate command).
-3. Do not write ad hoc PowerShell or Python scripts to manipulate .docx files directly.
+If prepare-session does not report a Protection line, skip the protect
+step entirely without mentioning it.
 
-Before editing any document:
-- Run normalize to verify the source is a valid OOXML package.
-- Run validate-spec to check the spec before applying it.
-- Use publish instead of insert for final outputs.
-
-Executable: cargo +stable-x86_64-pc-windows-msvc run --
-Spec examples: .\examples\document-update.json, .\examples\review-comments.json
+Password handling:
+- Ask for the password only once per session, at the moment it is first needed.
+- Never store, log, or repeat the password in any output visible to the user
+  beyond what is strictly required to pass it as a --password argument.
+- If the user says "same password as before", reuse the one already in context.
 ```
 
 ### System prompt pattern — any AI assistant
@@ -187,6 +200,8 @@ When the user asks you to create, edit, update, annotate, or publish a Word docu
 3. Run the appropriate wordflow command: normalize → validate-spec → publish.
 4. Do not generate file content directly or use Word COM for editing tasks.
 5. Only use the migrate command when the source is protected or not a valid OOXML package.
+6. If prepare-session reports Protection in its output, run protect as the last step.
+   Ask the user for the password only if PasswordRequired  true also appears.
 
 wordflow executable: cargo +stable-x86_64-pc-windows-msvc run --
 Spec format reference: see examples/ in the wordflow repository.
@@ -194,7 +209,7 @@ Spec format reference: see examples/ in the wordflow repository.
 
 ### Agent skill definition pattern
 
-If you are building an agent skill that wraps wordflow, structure it around the four core stages:
+If you are building an agent skill that wraps wordflow, structure it around these stages:
 
 | Stage | wordflow command | When to use |
 |---|---|---|
@@ -202,8 +217,9 @@ If you are building an agent skill that wraps wordflow, structure it around the 
 | Spec validation | `validate-spec` | After authoring the JSON spec, before applying it |
 | Edit or review | `insert`, `add-comment`, `publish` | Apply the change with the right level of finality |
 | Publish | `publish`, `publish-next` | When the candidate is validated and ready |
+| Re-protect | `protect` | After the final publish, when the source was protected |
 
-A skill should never skip the preflight stage and should never write directly to the destination without a validate step.
+A skill should never skip the preflight stage, never write directly to the destination without a validate step, and never skip the re-protect step when the source required it.
 
 ### What to tell the agent explicitly
 
@@ -214,6 +230,7 @@ When prompting an agent to work on a document, the most reliable requests includ
 - The section or anchor where the change should go
 - Whether changes should be visible (`highlight`, tracked changes) or clean
 - Whether review comments should be added instead of direct edits
+- Whether you want the final output protected (the agent detects this automatically, but you can mention it explicitly)
 
 ---
 
@@ -247,7 +264,7 @@ That approach is slow, hard to reason about, and hard to reuse.
 
 With `wordflow`, the goal is:
 
-1. Stage work in `C:\Temp`
+1. Stage work in `.wordflow/` adjacent to the document
 2. Use a single candidate output
 3. Validate before publish
 4. Reject bad candidates early
@@ -327,6 +344,7 @@ Use this matrix as the quickest source of truth for what the tool supports today
 | Validation and inspection | [x] | [ ] | `validate-spec`, `validate`, `inspect`, `list-parts`, `find-anchors`, `diff-docx`, `check-fidelity` |
 | Normalization and staged publish | [x] | [ ] | `normalize`, `publish`, reusable sessions, and `publish-next` |
 | Protected-source migration | [ ] | [x] | supported workflow, but non-OOXML conversion still depends on the guarded Word-backed migration path |
+| Protection round-trip | [x] | [ ] | `prepare-session` captures protection metadata; `protect` re-applies it after N edits — Windows only |
 
 If a feature area is not listed here, treat it as not yet committed as part of the reusable workflow contract.
 
@@ -344,41 +362,88 @@ wordflow/
 |  \- structured-update.json
 \- src/
    |- main.rs
-   \- lib.rs
+   |- lib.rs
+   \- session.rs
 ```
 
 ## Build and test
 
-From this folder:
+**Windows (primary target — required for Word COM commands):**
 
 ```powershell
 cargo +stable-x86_64-pc-windows-msvc test
 ```
 
-Cargo is configured to place build artifacts and the generated executable under:
+**Linux / macOS (all non-COM commands):**
 
-`C:\Temp\wordflow-target`
-
-This keeps the working repository under a cloud sync provider focused on source files while `cargo run`, `cargo build`, and `cargo test` execute the binary from `C:\Temp`.
-
-If you need to override that location for a one-off run:
-
-```powershell
-$env:CARGO_TARGET_DIR = 'C:\Temp\wordflow-target'
-cargo +stable-x86_64-pc-windows-msvc test
+```bash
+cargo test
 ```
+
+The `migrate` command and the `--allow-word-com-encrypted-package` flag on `normalize` require Windows with Word installed. All other commands — editing, publishing, validation, comments, inspection, sessions — run on Linux and macOS without Word.
+
+The 59 unit tests in `src/lib.rs` and `src/session.rs` cover only the cross-platform surface and pass on any OS.
 
 ## Runtime workspace
 
-The staged workflows default to:
+Each workflow command that needs staging creates a `.wordflow/` directory adjacent to the input document:
 
-`C:\Temp\wordflow`
+```
+C:\Work\
+├── contrato-v007.docx              ← --input
+├── contrato-v008.docx              ← --output (published)
+└── .wordflow/
+    ├── wordflow.log                ← always-on log file
+    ├── contrato.session.json       ← publish audit trail
+    ├── run-<pid>-<stamp>/          ← ephemeral staging dir (cleaned on success)
+    └── sessions/
+        └── <session-id>/           ← persistent normalized working copy
+```
 
-This is intentional. The tool assumes:
+If there is no parent directory (e.g. `--input document.docx` with no path prefix), the `.wordflow/` directory is created in the current working directory.
 
-- The source may be open in Word
-- The source may be under a cloud sync provider
-- Intermediate artifacts should not be created directly next to the destination file
+Override the workspace location for any command with `--temp-root`:
+
+```powershell
+wordflow publish `
+  --input "C:\Work\contrato-v007.docx" `
+  --output "C:\Work\contrato-v008.docx" `
+  --spec ".\examples\document-update.json" `
+  --temp-root "D:\scratch\wordflow"
+```
+
+`.wordflow/` is excluded from version control via `.gitignore`.
+
+## Logging
+
+Every run writes structured logs to two destinations simultaneously:
+
+| Destination | Content | Format |
+|---|---|---|
+| stderr | real-time progress | `timestamp  LEVEL  message` |
+| `.wordflow/wordflow.log` | persistent audit trail | `timestamp  LEVEL  message` |
+
+Example output for a `publish` run:
+
+```
+2026-05-21T10:23:44.001Z  INFO wordflow 0.1.0
+2026-05-21T10:23:44.003Z  INFO publish workflow started input=contrato-v007.docx output=contrato-v008.docx
+2026-05-21T10:23:44.087Z  INFO applying spec operations=3
+2026-05-21T10:23:44.412Z  INFO output published output=contrato-v008.docx
+2026-05-21T10:23:44.415Z  INFO temp workspace cleaned up
+```
+
+On failure:
+
+```
+2026-05-21T10:23:44.501Z  WARN publish failed — temp workspace preserved for debugging temp_dir=.wordflow/run-123/
+```
+
+The default log level is `INFO`. To enable debug output:
+
+```bash
+RUST_LOG=debug wordflow publish ...
+```
 
 ## Command overview
 
@@ -395,6 +460,7 @@ This is intentional. The tool assumes:
 | `update-comment` | update the body or metadata of an existing comment | document review |
 | `delete-comment` | remove a comment and its in-document references | document review |
 | `migrate` | convert a protected/ambiguous source into OOXML through Word | establish a safe OOXML base |
+| `protect` | re-apply the original document protection after N editing iterations | close a protected round-trip |
 | `validate-spec` | reject invalid highlights, anchors, and missing assets before document edits run | spec authoring |
 | `validate` | check package structure and XML parsing | technical validation |
 | `check-fidelity` | compare inherited formatting between two OOXML docs | trust decision before publish or migration |
@@ -479,7 +545,7 @@ This is the preferred command for final document updates.
 
 Behavior:
 
-1. Creates or uses the temp root under `C:\Temp`
+1. Creates or uses `.wordflow/` adjacent to the input document
 2. Copies the source there
 3. Checks that the staged source is already normalized for OpenXML editing
 4. Validates the staged source
@@ -509,7 +575,7 @@ cargo +stable-x86_64-pc-windows-msvc run -- publish `
 
 ### 5. `prepare-session`
 
-Prepare or reuse a normalized working copy in `C:\Temp\wordflow\sessions\<session-id>`.
+Prepare or reuse a normalized working copy in `.wordflow/sessions/<session-id>/` adjacent to the input document.
 
 Use this when:
 
@@ -590,7 +656,7 @@ Preferred when the source is:
 
 Behavior:
 
-1. Stages the source in `C:\Temp`
+1. Stages the source in `.wordflow/` adjacent to the input document
 2. Exports source text through Word
 3. Converts `source -> RTF -> OOXML`
 4. Exports migrated text through Word
@@ -616,7 +682,42 @@ cargo +stable-x86_64-pc-windows-msvc run -- migrate `
   --trusted-ooxml "C:\path\trusted-base.docx"
 ```
 
-### 9. `validate`
+### 9. `protect`
+
+Re-applies the original document protection to the latest published version in a session. Requires Windows with Word installed.
+
+Use this when:
+
+- The source was a password-encrypted or protection-restricted document
+- You used `prepare-session` + `publish-next` for N editing iterations
+- You need to deliver a protected output as a final step
+
+`prepare-session` automatically captures the protection type, password requirement, and IRM status during the Word COM migration. `protect` reads that metadata and re-applies it.
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc run -- protect `
+  --session "contrato-session" `
+  --output "C:\path\contrato-v010-protected.docx" `
+  --password "secret"
+```
+
+Without a password (editing restriction only, no encryption):
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc run -- protect `
+  --session "contrato-session" `
+  --output "C:\path\contrato-v010-protected.docx"
+```
+
+`protect` will error descriptively if:
+
+- The session was created from a plain OOXML source — no protection metadata exists
+- The original required a password but `--password` was not provided
+- The original document had no protection at all
+
+The command uses the `current_version_path` stored in the session metadata as its input, so it always protects the latest published version without needing `--input`.
+
+### 10. `validate`
 
 Checks whether the package is readable as normalized OOXML and whether XML parts parse correctly.
 
@@ -719,6 +820,18 @@ cargo +stable-x86_64-pc-windows-msvc run -- diff-docx --before "C:\path\old.docx
 2. `normalize` or `migrate`, depending on the available backend
 3. Optional `check-fidelity`
 4. `publish`
+
+### Protected document round-trip with N editing iterations
+
+Use this when the source is password-encrypted or protection-restricted and the final delivery must also be protected.
+
+1. `prepare-session` — normalizes the source via Word COM (slow, once), captures protection metadata
+2. `validate-spec` — verify the spec before any edits
+3. `publish-next --session ... --target latest` — iterate freely on content (fast, pure Rust)
+4. `publish-next --session ...` — close a new numbered version when ready
+5. `protect --session ... --output ... --password "..."` — re-apply original protection (slow, once)
+
+The agent asks the user for the password only once, at step 5. Steps 3–4 are as fast as working on a plain OOXML document.
 
 ### Investigate why a candidate is bad
 
@@ -922,7 +1035,7 @@ That maps well to the current simple-table support.
 
 ## Session history
 
-Every successful `publish` and `publish-next` call automatically writes or appends to a `.session.json` file placed alongside the document, in the same folder.
+Every successful `publish` and `publish-next` call automatically writes or appends to a `.session.json` file placed inside `.wordflow/`, adjacent to the document.
 
 The session file name is derived from the document base name, without the version suffix:
 
@@ -931,7 +1044,8 @@ C:\Work\
 ├── report-v014.docx
 ├── report-v015.docx
 ├── report-v016.docx
-└── report.session.json     ← created automatically, shared across all versions
+└── .wordflow\
+    └── report.session.json     ← created automatically, shared across all versions
 ```
 
 The file is not versioned — it is a single persistent record that accumulates entries over the entire life of the document.
