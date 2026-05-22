@@ -2015,6 +2015,7 @@ function Get-ParagraphSignatureObjects($document) {{
 
 $sourceSignatures = $null
 $migratedSignatures = $null
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $word = New-Object -ComObject Word.Application
 $word.Visible = $false
 try {{
@@ -2039,31 +2040,33 @@ try {{
     irm_enabled     = $irmEnabled
     irm_url         = $irmUrl
   }}
-  $protData | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath {protection_metadata_path}
+  [System.IO.File]::WriteAllText({protection_metadata_path}, ($protData | ConvertTo-Json -Depth 3), $utf8NoBom)
   $doc.SaveAs2({source_export}, 2)
   $sourceSignatures = Get-ParagraphSignatureObjects $doc
-  $doc.Close()
+  $doc.Close(0)
 
   $doc = $word.Documents.Open({staged_input}, $false, $true)
   $doc.SaveAs2({rtf_output}, 6)
-  $doc.Close()
+  $doc.Close(0)
 
   $rtf = $word.Documents.Open({rtf_output}, $false, $false)
   $rtf.SaveAs2({migrated_output}, 16)
-  $rtf.Close()
+  $rtf.Close(0)
 
   $migrated = $word.Documents.Open({migrated_output}, $false, $true)
   $migrated.SaveAs2({migrated_export}, 2)
   $migratedSignatures = Get-ParagraphSignatureObjects $migrated
-  $migrated.Close()
+  $migrated.Close(0)
 }}
 finally {{
   $word.Quit()
   [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
+  [System.GC]::Collect()
+  [System.GC]::WaitForPendingFinalizers()
 }}
 
-$sourceSignatures | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath {source_signatures}
-$migratedSignatures | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath {migrated_signatures}"#,
+[System.IO.File]::WriteAllText({source_signatures}, ($sourceSignatures | ConvertTo-Json -Depth 5), $utf8NoBom)
+[System.IO.File]::WriteAllText({migrated_signatures}, ($migratedSignatures | ConvertTo-Json -Depth 5), $utf8NoBom)"#,
         staged_input = ps_single_quoted(staged_input),
         source_export = ps_single_quoted(source_export),
         source_signatures = ps_single_quoted(source_signatures),
