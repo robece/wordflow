@@ -8,9 +8,9 @@ use wordflow::{
     AnchorMatchMode, AnchorSpec, AnchorTarget, AutomationSpec, CommentSpec, CommentUpdate,
     protect_document_from_session,
     add_comment_to_docx, apply_spec_file_to_docx, apply_spec_file_to_docx_dry_run,
-    delete_docx_comment, diff_docx_files, find_anchors_in_docx,
-    inspect_normalization_file, list_docx_parts, migrate_source_to_ooxml, normalize_docx_file,
-    normalize_docx_file_to_versioned_output,
+    clear_document_registry, delete_docx_comment, diff_docx_files, find_anchors_in_docx,
+    inspect_normalization_file, list_docx_parts, list_registered_documents, migrate_source_to_ooxml,
+    normalize_docx_file, normalize_docx_file_to_versioned_output,
     list_docx_comments, prepare_work_session, publish_session_to_next_version,
     publish_spec_file_to_docx, publish_spec_file_to_next_version, update_docx_comment,
     validate_docx_file, validate_source_fidelity_file, validate_spec_file, ParagraphStyle,
@@ -298,7 +298,7 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
 
-        /// Password to re-apply if the original was password-encrypted.
+        /// Optional password to re-apply if the original was password-encrypted.
         #[arg(long)]
         password: Option<String>,
 
@@ -306,14 +306,29 @@ enum Commands {
         #[arg(long)]
         temp_root: Option<PathBuf>,
     },
+    /// List all documents registered in the user-profile .wordflow folder.
+    ListDocuments,
+    /// Remove one or all document entries from the user-profile .wordflow registry.
+    ClearDocuments {
+        /// Name of the document to remove (stem without extension, e.g. "ux-requirements").
+        /// If omitted, all registered documents are removed.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 fn setup_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::Registry;
 
-    let log_dir = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+    // Write the global wordflow.log to the user-profile .wordflow root so all
+    // activity across all documents is captured in one predictable place.
+    let log_dir = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        })
         .join(".wordflow");
     std::fs::create_dir_all(&log_dir).ok();
 
@@ -760,6 +775,60 @@ fn main() -> Result<()> {
                 report.protected_output.display(),
                 report.protection_type_name
             );
+        }
+        Commands::ListDocuments => {
+            let docs = list_registered_documents();
+            if docs.is_empty() {
+                println!("No documents registered in .wordflow profile.");
+            } else {
+                println!("{:<30} {:<20} {}", "DOCUMENT", "LAST ACCESSED", "CURRENT VERSION");
+                println!("{}", "-".repeat(90));
+                for doc in docs {
+                    use std::time::{Duration, UNIX_EPOCH};
+                    let accessed = UNIX_EPOCH
+                        .checked_add(Duration::from_secs(doc.last_accessed))
+                        .and_then(|t| {
+                            let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+                            // Format as YYYY-MM-DD HH:MM (UTC, best-effort)
+                            let days = secs / 86400;
+                            let rem = secs % 86400;
+                            let h = rem / 3600;
+                            let m = (rem % 3600) / 60;
+                            let epoch_days_to_ymd = |d: u64| -> (u32, u32, u32) {
+                                let days = d as i64 + 719468;
+                                let era = if days >= 0 { days } else { days - 146096 } / 146097;
+                                let doe = (days - era * 146097) as u32;
+                                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                                let y = yoe as i64 + era * 400;
+                                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                                let mp = (5 * doy + 2) / 153;
+                                let day = doy - (153 * mp + 2) / 5 + 1;
+                                let month = if mp < 10 { mp + 3 } else { mp - 9 };
+                                let year = if month <= 2 { y + 1 } else { y };
+                                (year as u32, month, day)
+                            };
+                            let (y, mo, d) = epoch_days_to_ymd(days);
+                            Some(format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}"))
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let version_file = std::path::Path::new(&doc.current_version)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&doc.current_version);
+                    println!("{:<30} {:<20} {}", doc.stem, accessed, version_file);
+                }
+            }
+        }
+        Commands::ClearDocuments { name } => {
+            let removed = clear_document_registry(name.as_deref())?;
+            if removed.is_empty() {
+                println!("Nothing to clear.");
+            } else {
+                for r in &removed {
+                    println!("Removed  {r}");
+                }
+                println!("Cleared {} document(s) from .wordflow profile.", removed.len());
+            }
         }
     }
 

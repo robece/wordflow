@@ -264,7 +264,7 @@ That approach is slow, hard to reason about, and hard to reuse.
 
 With `wordflow`, the goal is:
 
-1. Stage work in `.wordflow/` adjacent to the document
+1. Stage work in the user-profile `.wordflow\{document-stem}\` folder
 2. Use a single candidate output
 3. Validate before publish
 4. Reject bad candidates early
@@ -386,23 +386,28 @@ The 59 unit tests in `src/lib.rs` and `src/session.rs` cover only the cross-plat
 
 ## Runtime workspace
 
-Each workflow command that needs staging creates a `.wordflow/` directory adjacent to the input document:
+Every mutating command stores its staging artifacts and run logs in a named subdirectory of the user-profile `.wordflow` root:
 
 ```
-C:\Work\
-├── contrato-v007.docx              ← --input
-├── contrato-v008.docx              ← --output (published)
-└── .wordflow/
-    ├── wordflow.log                ← always-on log file
-    ├── contrato.session.json       ← publish audit trail
-    ├── run-<pid>-<stamp>/          ← ephemeral staging dir (cleaned on success)
-    └── sessions/
-        └── <session-id>/           ← persistent normalized working copy
+C:\Users\{user}\.wordflow\
+├── wordflow.log                ← global structured log (all documents, all runs)
+├── contrato\                   ← one folder per document stem
+│   ├── document.json           ← registry entry: source path, current version, last accessed
+│   ├── runs\
+│   │   └── run-<pid>-<stamp>\  ← per-run artifacts + run.log (retained on success)
+│   └── sessions\
+│       └── <session-id>\       ← persistent normalized working copy
+└── my-report\
+    ├── document.json
+    ├── runs\  ...
+    └── sessions\  ...
 ```
 
-If there is no parent directory (e.g. `--input document.docx` with no path prefix), the `.wordflow/` directory is created in the current working directory.
+Each document gets its own named subfolder derived from the document stem (`contrato` from `contrato-v007.docx`, `ux-requirements` from `ux-requirements.source.docx`, etc.). This makes the registry browsable at a glance from any file manager.
 
-Override the workspace location for any command with `--temp-root`:
+The `run-<pid>-<stamp>` folder and its `run.log` are **retained after successful runs** so every operation leaves an auditable trail. Only large intermediate staging files (source copy, candidate copy) are removed on success. The full workspace is preserved on failure for debugging.
+
+Override the workspace root for any command with `--temp-root`:
 
 ```powershell
 wordflow publish `
@@ -421,7 +426,8 @@ Every run writes structured logs to two destinations simultaneously:
 | Destination | Content | Format |
 |---|---|---|
 | stderr | real-time progress | `timestamp  LEVEL  message` |
-| `.wordflow/wordflow.log` | persistent audit trail | `timestamp  LEVEL  message` |
+| `C:\Users\{user}\.wordflow\wordflow.log` | global audit trail across all documents | `timestamp  LEVEL  message` |
+| `C:\Users\{user}\.wordflow\{stem}\runs\run-*\run.log` | per-run summary (command, input, output, status) | plain text key-value |
 
 Example output for a `publish` run:
 
@@ -430,13 +436,13 @@ Example output for a `publish` run:
 2026-05-21T10:23:44.003Z  INFO publish workflow started input=contrato-v007.docx output=contrato-v008.docx
 2026-05-21T10:23:44.087Z  INFO applying spec operations=3
 2026-05-21T10:23:44.412Z  INFO output published output=contrato-v008.docx
-2026-05-21T10:23:44.415Z  INFO temp workspace cleaned up
+2026-05-21T10:23:44.415Z  INFO run log written; temp workspace retained in .wordflow
 ```
 
 On failure:
 
 ```
-2026-05-21T10:23:44.501Z  WARN publish failed — temp workspace preserved for debugging temp_dir=.wordflow/run-123/
+2026-05-21T10:23:44.501Z  WARN publish failed — temp workspace preserved for debugging temp_dir=.wordflow/contrato/runs/run-123/
 ```
 
 The default log level is `INFO`. To enable debug output:
@@ -468,6 +474,8 @@ RUST_LOG=debug wordflow publish ...
 | `list-parts` | list package parts and hashes | inspection/debugging |
 | `inspect` | high-level package overview | quick health check |
 | `diff-docx` | compare changed parts across two docs | impact review |
+| `list-documents` | show all documents tracked in the user-profile `.wordflow` registry | see active document families |
+| `clear-documents` | remove one or all entries from the user-profile `.wordflow` registry | clean up stale document cache |
 
 ## Command details
 
@@ -545,7 +553,7 @@ This is the preferred command for final document updates.
 
 Behavior:
 
-1. Creates or uses `.wordflow/` adjacent to the input document
+1. Creates or uses `C:\Users\{user}\.wordflow\{document-stem}\` as the staging root
 2. Copies the source there
 3. Checks that the staged source is already normalized for OpenXML editing
 4. Validates the staged source
@@ -553,8 +561,8 @@ Behavior:
 6. Validates the candidate
 7. Runs source-fidelity checks for untouched paragraphs
 8. Publishes to the destination only if all checks pass
-9. Cleans temp on success
-10. Preserves temp on failure for debugging
+9. Retains the run folder with `run.log` on success (removes large staging files only)
+10. Preserves the full temp workspace on failure for debugging
 
 ```powershell
 cargo +stable-x86_64-pc-windows-msvc run -- publish `
@@ -575,7 +583,7 @@ cargo +stable-x86_64-pc-windows-msvc run -- publish `
 
 ### 5. `prepare-session`
 
-Prepare or reuse a normalized working copy in `.wordflow/sessions/<session-id>/` adjacent to the input document.
+Prepare or reuse a normalized working copy in `C:\Users\{user}\.wordflow\{document-stem}\sessions\<session-id>\`.
 
 Use this when:
 
@@ -656,7 +664,7 @@ Preferred when the source is:
 
 Behavior:
 
-1. Stages the source in `.wordflow/` adjacent to the input document
+1. Stages the source in `C:\Users\{user}\.wordflow\{document-stem}\runs\` adjacent to the input document
 2. Exports source text through Word
 3. Converts `source -> RTF -> OOXML`
 4. Exports migrated text through Word
@@ -795,6 +803,37 @@ cargo +stable-x86_64-pc-windows-msvc run -- list-parts --input "C:\path\source.d
 cargo +stable-x86_64-pc-windows-msvc run -- find-anchors --input "C:\path\source.docx" --text "Strategic principles" --mode equals --occurrence 2
 cargo +stable-x86_64-pc-windows-msvc run -- diff-docx --before "C:\path\old.docx" --after "C:\path\new.docx"
 ```
+
+### 13. Document registry commands
+
+Show all documents currently tracked in the user-profile `.wordflow` folder:
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc run -- list-documents
+```
+
+Output:
+
+```
+DOCUMENT                       LAST ACCESSED        CURRENT VERSION
+------------------------------------------------------------------------------------------
+ux-requirements                2026-05-22 22:05     ux-requirements-v001.docx
+contrato                       2026-05-21 14:30     contrato-v008.docx
+```
+
+Remove a specific document from the registry (removes its entire `.wordflow\{stem}\` folder):
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc run -- clear-documents --name ux-requirements
+```
+
+Remove all registered documents:
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc run -- clear-documents
+```
+
+These commands are designed to be called by AI skills or agents to present the user with an active-document list and let them resume working on an existing document without re-entering paths.
 
 ## Recommended usage patterns
 

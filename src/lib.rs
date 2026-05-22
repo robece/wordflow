@@ -73,16 +73,37 @@ const SESSION_METADATA_FILE: &str = "session.json";
 const SESSION_WORKING_DOCX_FILE: &str = "working-normalized.docx";
 const SESSION_PROTECTION_FILE: &str = "protection.json";
 
-fn default_temp_root(input_hint: Option<&Path>) -> PathBuf {
-    input_hint
-        .and_then(|p| p.parent())
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|dir| dir.join(".wordflow"))
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".wordflow")
+fn user_profile_wordflow_root() -> PathBuf {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         })
+        .join(".wordflow")
+}
+
+fn sanitize_stem_for_folder(stem: &str) -> String {
+    let sanitized: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() { "default".to_string() } else { sanitized }
+}
+
+fn default_temp_root(input_hint: Option<&Path>) -> PathBuf {
+    let profile_root = user_profile_wordflow_root();
+    let stem = input_hint
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("default");
+    profile_root.join(sanitize_stem_for_folder(stem))
 }
 
 fn resolve_temp_root(temp_root: Option<&Path>, input_hint: Option<&Path>) -> PathBuf {
@@ -90,6 +111,83 @@ fn resolve_temp_root(temp_root: Option<&Path>, input_hint: Option<&Path>) -> Pat
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_temp_root(input_hint))
 }
+
+const DOCUMENT_REGISTRY_FILE: &str = "document.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentEntry {
+    pub stem: String,
+    pub source_path: String,
+    pub current_version: String,
+    pub last_accessed: u64,
+}
+
+fn write_document_entry(temp_root: &Path, stem: &str, source_path: &Path, current_version: &Path) {
+    let entry = DocumentEntry {
+        stem: stem.to_string(),
+        source_path: source_path.to_string_lossy().to_string(),
+        current_version: current_version.to_string_lossy().to_string(),
+        last_accessed: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&entry) {
+        let _ = fs::create_dir_all(temp_root);
+        let _ = fs::write(temp_root.join(DOCUMENT_REGISTRY_FILE), json);
+    }
+}
+
+/// List all document entries registered in the user-profile `.wordflow` folder.
+pub fn list_registered_documents() -> Vec<DocumentEntry> {
+    let root = user_profile_wordflow_root();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut docs: Vec<DocumentEntry> = Vec::new();
+    for entry in entries.flatten() {
+        let doc_json = entry.path().join(DOCUMENT_REGISTRY_FILE);
+        if let Ok(raw) = fs::read_to_string(&doc_json) {
+            if let Ok(doc) = serde_json::from_str::<DocumentEntry>(&raw) {
+                docs.push(doc);
+            }
+        }
+    }
+    docs.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed));
+    docs
+}
+
+/// Remove one or all document entries from the user-profile `.wordflow` registry.
+/// If `name` is `Some`, only that document folder is removed.
+/// If `name` is `None`, the entire `.wordflow` root is removed.
+pub fn clear_document_registry(name: Option<&str>) -> Result<Vec<String>> {
+    let root = user_profile_wordflow_root();
+    let mut removed = Vec::new();
+    if let Some(target) = name {
+        let folder = root.join(sanitize_stem_for_folder(target));
+        if folder.exists() {
+            fs::remove_dir_all(&folder)
+                .with_context(|| format!("failed to remove {}", folder.display()))?;
+            removed.push(target.to_string());
+        } else {
+            bail!("no registered document named '{target}' found under {}", root.display());
+        }
+    } else {
+        if !root.exists() {
+            return Ok(removed);
+        }
+        for entry in fs::read_dir(&root)?.flatten() {
+            if entry.path().join(DOCUMENT_REGISTRY_FILE).exists() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                fs::remove_dir_all(entry.path())
+                    .with_context(|| format!("failed to remove {}", entry.path().display()))?;
+                removed.push(name);
+            }
+        }
+    }
+    Ok(removed)
+}
+
 const SUPPORTED_HIGHLIGHTS: &[&str] = &[
     "black",
     "blue",
@@ -1223,6 +1321,31 @@ pub fn normalize_docx_file(
                 )
             })?;
             verify_published_output_matches_candidate(output, &bytes)?;
+
+            // Always record a run log and update the document registry in the
+            // user-profile .wordflow folder so every mutating operation is auditable.
+            let wf_root = resolve_temp_root(temp_root, Some(input));
+            if let Ok(run_dir) = create_work_dir(&wf_root) {
+                let stamp_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let log = format!(
+                    "command: normalize\ntimestamp: {}\ninput: {}\noutput: {}\nformat: {}\nalready_normalized: true\nxml_parts_checked: {}\n",
+                    stamp_secs,
+                    input.display(),
+                    output.display(),
+                    normalization.format.as_str(),
+                    report.xml_parts_checked,
+                );
+                let _ = fs::write(run_dir.join("run.log"), &log);
+            }
+            let stem = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default");
+            write_document_entry(&wf_root, stem, input, output);
+
             Ok(NormalizeWorkflowReport {
                 detected_format: normalization.format,
                 already_normalized: true,
@@ -1535,11 +1658,46 @@ fn publish_spec_file_to_docx_internal(
 
     match workflow {
         Ok(report) => {
-            cleanup_temp_dir(&temp_dir)?;
-            tracing::debug!("temp workspace cleaned up");
+            // Remove large intermediates but keep the run folder with a log so
+            // every successful publish leaves an auditable trail in .wordflow.
+            let _ = fs::remove_file(&staged_input);
+            let _ = fs::remove_file(&candidate_output);
+            let stamp_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let log = format!(
+                "command: publish\ntimestamp: {}\ninput: {}\noutput: {}\nxml_parts_checked: {}\nstatus: ok\n",
+                stamp_secs,
+                input.display(),
+                report.published_output.display(),
+                report.xml_parts_checked,
+            );
+            let _ = fs::write(temp_dir.join("run.log"), &log);
+            // Update the document registry with the new current version.
+            let wf_root = resolve_temp_root(temp_root, Some(input));
+            let stem = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default");
+            write_document_entry(&wf_root, stem, input, &report.published_output);
+            tracing::debug!("run log written; temp workspace retained in .wordflow");
             Ok(report)
         }
         Err(err) => {
+            // Write failure log before preserving the full workspace for debugging.
+            let stamp_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let log = format!(
+                "command: publish\ntimestamp: {}\ninput: {}\noutput: {}\nstatus: failed\nerror: {}\n",
+                stamp_secs,
+                input.display(),
+                output.display(),
+                err,
+            );
+            let _ = fs::write(temp_dir.join("run.log"), &log);
             tracing::warn!(temp_dir = %temp_dir.display(), "publish failed — temp workspace preserved for debugging");
             Err(err.context(format!(
                 "publish workflow aborted; temporary workspace preserved at {}",
@@ -2006,8 +2164,9 @@ pub fn diff_docx_files(before: &Path, after: &Path) -> Result<DiffSummary> {
 }
 
 fn create_work_dir(temp_root: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(temp_root)
-        .with_context(|| format!("failed to create temp root {}", temp_root.display()))?;
+    let runs_root = temp_root.join("runs");
+    fs::create_dir_all(&runs_root)
+        .with_context(|| format!("failed to create runs root {}", runs_root.display()))?;
 
     let pid = process::id();
     let stamp = SystemTime::now()
@@ -2015,7 +2174,7 @@ fn create_work_dir(temp_root: &Path) -> Result<PathBuf> {
         .unwrap_or_default()
         .as_millis();
     for attempt in 0..100u32 {
-        let candidate = temp_root.join(format!("run-{pid}-{stamp}-{attempt}"));
+        let candidate = runs_root.join(format!("run-{pid}-{stamp}-{attempt}"));
         if candidate.exists() {
             continue;
         }
@@ -2026,7 +2185,7 @@ fn create_work_dir(temp_root: &Path) -> Result<PathBuf> {
 
     bail!(
         "failed to allocate a unique temp workspace under {}",
-        temp_root.display()
+        runs_root.display()
     )
 }
 
@@ -3134,6 +3293,33 @@ pub fn publish_session_to_next_version(
         metadata.output_dir = parent.to_string_lossy().to_string();
     }
     save_work_session_metadata(temp_root, &metadata)?;
+
+    // Write a run log adjacent to the session so every publish from a session
+    // leaves an auditable entry in .wordflow. Also update the document registry.
+    {
+        let wf_root = resolve_temp_root(Some(temp_root), None);
+        if let Ok(run_dir) = create_work_dir(&wf_root) {
+            let stamp_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let log = format!(
+                "command: publish-next\ntimestamp: {}\nsession: {}\noutput: {}\nversion: {}\nxml_parts_checked: {}\nstatus: ok\n",
+                stamp_secs,
+                session_id,
+                resolved_output.display(),
+                version_number,
+                candidate_validation.xml_parts_checked,
+            );
+            let _ = fs::write(run_dir.join("run.log"), &log);
+        }
+        let source_path = PathBuf::from(&metadata.normalized_path);
+        let stem = source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(session_id);
+        write_document_entry(&wf_root, stem, &source_path, &resolved_output);
+    }
 
     Ok(PublishNextWorkflowReport {
         xml_parts_checked: candidate_validation.xml_parts_checked,
@@ -5505,11 +5691,20 @@ mod tests {
         assert!(report.xml_parts_checked > 0);
         assert!(output_path.exists());
         assert!(temp_root.exists());
-        assert_eq!(
-            fs::read_dir(&temp_root).expect("temp root").count(),
-            0,
-            "success path should clean temporary workspace"
-        );
+        // Success path retains the run folder with a run.log for auditability.
+        // Runs are now stored under temp_root/runs/.
+        let runs_root = temp_root.join("runs");
+        assert!(runs_root.exists(), "runs/ subfolder should exist under temp_root");
+        let run_dirs: Vec<_> = fs::read_dir(&runs_root)
+            .expect("runs root")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(run_dirs.len(), 1, "success path should keep exactly one run folder");
+        let run_log = run_dirs[0].path().join("run.log");
+        assert!(run_log.exists(), "run.log should exist in the run folder");
+        let log_content = fs::read_to_string(&run_log).expect("read run.log");
+        assert!(log_content.contains("command: publish"), "run.log should record the command");
+        assert!(log_content.contains("status: ok"), "run.log should record ok status");
 
         let bytes = fs::read(&output_path).expect("read output");
         let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("zip");
@@ -6099,21 +6294,26 @@ mod tests {
     }
 
     #[test]
-    fn default_temp_root_derives_from_input_parent() {
+    fn default_temp_root_derives_from_document_stem() {
         let input = Path::new("/some/dir/document.docx");
-        assert_eq!(default_temp_root(Some(input)), PathBuf::from("/some/dir/.wordflow"));
+        let root = default_temp_root(Some(input));
+        // New behavior: profile root / document-stem
+        assert!(root.ends_with("document"), "expected stem subfolder, got {}", root.display());
+        assert!(root.to_string_lossy().contains(".wordflow"), "expected .wordflow in path, got {}", root.display());
     }
 
     #[test]
-    fn default_temp_root_falls_back_to_current_dir_when_no_input() {
+    fn default_temp_root_falls_back_to_default_when_no_input() {
         let root = default_temp_root(None);
-        assert_eq!(root, std::env::current_dir().unwrap().join(".wordflow"));
+        assert!(root.to_string_lossy().contains(".wordflow"), "expected .wordflow in path");
+        assert!(root.ends_with("default"), "expected 'default' subfolder, got {}", root.display());
     }
 
     #[test]
-    fn default_temp_root_falls_back_to_current_dir_when_input_has_no_parent() {
+    fn default_temp_root_uses_stem_when_input_has_no_parent() {
         let root = default_temp_root(Some(Path::new("document.docx")));
-        assert_eq!(root, std::env::current_dir().unwrap().join(".wordflow"));
+        assert!(root.ends_with("document"), "expected stem subfolder, got {}", root.display());
+        assert!(root.to_string_lossy().contains(".wordflow"), "expected .wordflow in path");
     }
 
     #[test]
@@ -6127,18 +6327,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_temp_root_derives_from_input_when_not_provided() {
+    fn resolve_temp_root_derives_stem_from_input_when_not_provided() {
         let input = Path::new("/docs/report.docx");
-        assert_eq!(
-            resolve_temp_root(None, Some(input)),
-            PathBuf::from("/docs/.wordflow")
-        );
+        let root = resolve_temp_root(None, Some(input));
+        assert!(root.ends_with("report"), "expected 'report' stem folder, got {}", root.display());
+        assert!(root.to_string_lossy().contains(".wordflow"), "expected .wordflow in path");
     }
 
     #[test]
-    fn resolve_temp_root_falls_back_to_current_dir_without_input() {
+    fn resolve_temp_root_falls_back_to_default_without_input() {
         let root = resolve_temp_root(None, None);
-        assert_eq!(root, std::env::current_dir().unwrap().join(".wordflow"));
+        assert!(root.ends_with("default"), "expected 'default' stem folder, got {}", root.display());
+        assert!(root.to_string_lossy().contains(".wordflow"), "expected .wordflow in path");
+    }
+
+    #[test]
+    fn sanitize_stem_handles_special_characters() {
+        assert_eq!(sanitize_stem_for_folder("ux-requirements"), "ux-requirements");
+        assert_eq!(sanitize_stem_for_folder("my doc 2024"), "my_doc_2024");
+        assert_eq!(sanitize_stem_for_folder("report.v2"), "report_v2");
+        assert_eq!(sanitize_stem_for_folder(""), "default");
     }
 
     #[test]

@@ -64,6 +64,7 @@ If a feature is only partial, the README matrix must say so explicitly instead o
 | Notes, content controls, fields | [x] | [ ] | footnotes/endnotes, content controls, and complex fields |
 | Header/footer and core properties | [x] | [ ] | reusable document-structure updates |
 | Validation, inspection, sessions, publish | [x] | [ ] | normalization, validation, fidelity checks, staged publish, reusable sessions |
+| Document registry | [x] | [ ] | user-profile `.wordflow` registry with `list-documents` and `clear-documents` |
 | Protected-source migration | [ ] | [x] | supported workflow, but still intentionally depends on a guarded Word-backed conversion path |
 | Protection round-trip | [x] | [ ] | `prepare-session` captures protection metadata; `protect` re-applies it — Windows only |
 
@@ -198,19 +199,27 @@ The tool should assume all of the following unless proven otherwise:
 
 ## Default runtime workspace
 
-The default runtime workspace is `.wordflow/` created adjacent to the `--input` document:
+The default runtime workspace is the user-profile `.wordflow` root, with a named subfolder per document stem:
 
 ```
-<input-document-directory>/
-└── .wordflow/
-    ├── wordflow.log                ← always-on structured log (INFO level)
-    ├── <stem>.session.json         ← publish audit trail (shared across all versions)
-    ├── run-<pid>-<stamp>/          ← ephemeral staging (cleaned on success)
-    └── sessions/
-        └── <session-id>/           ← persistent normalized working copy
+C:\Users\{user}\.wordflow\
+├── wordflow.log                ← global structured log (INFO level, all documents)
+├── {document-stem}\            ← one folder per document (derived from --input file stem)
+│   ├── document.json           ← registry: source path, current version, last accessed (epoch)
+│   ├── runs\
+│   │   └── run-<pid>-<stamp>\  ← per-run staging artifacts + run.log
+│   └── sessions\
+│       └── <session-id>\       ← persistent normalized working copy
 ```
 
-If the input has no parent directory (bare filename), `.wordflow/` is created in the current working directory.
+For example, normalizing `ux-requirements.source.docx` creates:
+
+```
+C:\Users\robece\.wordflow\ux-requirements\document.json
+C:\Users\robece\.wordflow\ux-requirements\runs\run-<pid>-<stamp>\run.log
+```
+
+`document.json` stores the source path, the current published version path, and the last-accessed timestamp. The `list-documents` command reads these files across all document subfolders to present a registry of active document families.
 
 The caller may override this with `--temp-root`. The directory is created automatically if it does not exist. `.wordflow/` is excluded from version control via `.gitignore`.
 
@@ -259,15 +268,10 @@ The tool should never write to the final destination before:
 
 ### Temp cleanup policy
 
-- on success: clean temp workspace
-- on failure: preserve temp workspace for debugging
+- on success: remove large intermediate files (staged source copy, candidate copy); **retain** the run folder with `run.log` for auditability
+- on failure: preserve the full temp workspace for debugging
 
-This is intentional behavior, not accidental residue.
-
-Reusable sessions are different:
-
-- session metadata and the normalized working copy should persist across successful runs
-- ephemeral candidate workspaces created during a session-backed publish should still be cleaned on success
+This is intentional behavior, not accidental residue. Every successful operation leaves an auditable `run.log` entry in the user-profile `.wordflow\{stem}\runs\` folder.
 
 ## Format fidelity rule
 
@@ -293,13 +297,17 @@ Every document workflow should begin by checking whether the source is already n
 
 ## Session concepts
 
-There are two distinct session concepts inside `.wordflow/` — do not confuse them:
+There are three distinct persistence concepts inside the user-profile `.wordflow` root — do not confuse them:
 
-**1. Publish audit log** — `<stem>.session.json`
+**1. Document registry entry** — `{document-stem}\document.json`
+
+A lightweight JSON record written or updated by every mutating command (`normalize`, `publish`, `publish-next`). Contains: stem, source path, current published version path, last-accessed timestamp. Read by `list-documents` and consumed by AI skills to present an active-document list.
+
+**2. Publish audit log** — `<stem>.session.json`
 
 A timestamped record of every successful `publish` and `publish-next` call. Written by `track_session` in `session.rs`. Shared across all versions of the same document family. Survives across tool runs indefinitely.
 
-**2. Work session cache** — `sessions/<session-id>/`
+**3. Work session cache** — `{document-stem}\sessions\<session-id>\`
 
 A normalized working copy managed by `prepare-session`. Used by `publish-next --session` to avoid re-normalizing the source on every run. Keyed by session ID. Reused when the source path and hash match; refreshed when the source changes.
 
@@ -309,7 +317,7 @@ The cache belongs to the work session, not to the document:
 - source hash for reuse decisions
 - current published version path for `publish-next`
 
-Do not embed either type of session state into the `.docx` package.
+Do not embed any of these session state types into the `.docx` package.
 
 ## Protected / IRM workflow rule
 
@@ -346,7 +354,7 @@ Re-protection rules:
 
 ## Build and test rules
 
-The 64 unit tests cover the cross-platform surface (OOXML editing, validation, sessions, publish workflows). They run on any OS:
+The 67 unit tests cover the cross-platform surface (OOXML editing, validation, sessions, publish workflows, document registry). They run on any OS:
 
 ```bash
 cargo test
