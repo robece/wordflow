@@ -162,6 +162,7 @@ pub struct NormalizeWorkflowReport {
     pub already_normalized: bool,
     pub xml_parts_checked: usize,
     pub published_output: PathBuf,
+    pub version_number: Option<usize>,
     pub protection: Option<ProtectionMetadata>,
 }
 
@@ -1088,6 +1089,60 @@ fn resolve_versioned_output_path(
     }
 }
 
+fn resolve_normalize_versioned_output_path(output_path: &Path) -> Result<(PathBuf, usize)> {
+    if parse_versioned_stem(output_path).is_ok() {
+        return resolve_versioned_output_path(output_path, None, PublishTargetMode::NextVersion);
+    }
+
+    let directory = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create output directory {}", directory.display()))?;
+
+    let stem = output_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+        .with_context(|| format!("path must include a UTF-8 file stem: {}", output_path.display()))?;
+    let extension = output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+        .with_context(|| format!("path must include an extension: {}", output_path.display()))?;
+
+    let pattern = Regex::new(&format!(
+        r"^{}-v(?P<number>\d+)\.{}$",
+        regex::escape(&stem),
+        regex::escape(&extension)
+    ))
+    .context("invalid normalize-version regex")?;
+
+    let mut max_version = 0usize;
+    let mut width = 3usize;
+    for entry in fs::read_dir(&directory)
+        .with_context(|| format!("failed to read output directory {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to inspect {}", directory.display()))?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if let Some(captures) = pattern.captures(file_name)
+            && let Some(number) = captures.name("number")
+            && let Ok(version) = number.as_str().parse::<usize>()
+        {
+            max_version = max_version.max(version);
+            width = width.max(number.as_str().len());
+        }
+    }
+
+    let next_version = max_version + 1;
+    let file_name = format!("{stem}-v{:0width$}.{extension}", next_version, width = width);
+    Ok((directory.join(file_name), next_version))
+}
+
 pub fn inspect_normalization_file(input: &Path) -> Result<NormalizationReport> {
     let bytes = fs::read(input).with_context(|| format!("failed to read {}", input.display()))?;
     Ok(inspect_normalization_bytes(&bytes))
@@ -1173,6 +1228,7 @@ pub fn normalize_docx_file(
                 already_normalized: true,
                 xml_parts_checked: report.xml_parts_checked,
                 published_output: output.to_path_buf(),
+                version_number: None,
                 protection: None,
             })
         }
@@ -1184,6 +1240,7 @@ pub fn normalize_docx_file(
                 already_normalized: false,
                 xml_parts_checked: report.xml_parts_checked,
                 published_output: report.published_output,
+                version_number: None,
                 protection: report.protection,
             })
         }
@@ -1197,6 +1254,25 @@ pub fn normalize_docx_file(
             );
         }
     }
+}
+
+pub fn normalize_docx_file_to_versioned_output(
+    input: &Path,
+    output: &Path,
+    temp_root: Option<&Path>,
+    trusted_ooxml: Option<&Path>,
+    allow_word_com_encrypted_package: bool,
+) -> Result<NormalizeWorkflowReport> {
+    let (resolved_output, version_number) = resolve_normalize_versioned_output_path(output)?;
+    let mut report = normalize_docx_file(
+        input,
+        &resolved_output,
+        temp_root,
+        trusted_ooxml,
+        allow_word_com_encrypted_package,
+    )?;
+    report.version_number = Some(version_number);
+    Ok(report)
 }
 
 pub fn validate_spec_file(spec_path: &Path) -> Result<usize> {
@@ -5647,6 +5723,39 @@ mod tests {
         assert!(report.already_normalized);
         assert!(report.xml_parts_checked > 0);
         assert_eq!(fs::read(&input_path).expect("read input"), fs::read(&output_path).expect("read output"));
+    }
+
+    #[test]
+    fn normalize_versioned_output_starts_at_v001_for_unversioned_base() {
+        let dir = tempdir().expect("temp dir");
+        let input_path = dir.path().join("input.docx");
+        let output_path = dir.path().join("normalized.docx");
+        fs::write(&input_path, make_minimal_docx().expect("docx")).expect("write input");
+
+        let report = normalize_docx_file_to_versioned_output(&input_path, &output_path, None, None, false)
+            .expect("normalize");
+        assert_eq!(report.version_number, Some(1));
+        assert!(report.published_output.ends_with("normalized-v001.docx"));
+        assert!(report.published_output.exists());
+    }
+
+    #[test]
+    fn normalize_versioned_output_increments_existing_versions() {
+        let dir = tempdir().expect("temp dir");
+        let input_path = dir.path().join("input.docx");
+        let output_path = dir.path().join("normalized.docx");
+        let existing_v1 = dir.path().join("normalized-v001.docx");
+        let existing_v2 = dir.path().join("normalized-v002.docx");
+        let bytes = make_minimal_docx().expect("docx");
+        fs::write(&input_path, &bytes).expect("write input");
+        fs::write(&existing_v1, &bytes).expect("write v1");
+        fs::write(&existing_v2, &bytes).expect("write v2");
+
+        let report = normalize_docx_file_to_versioned_output(&input_path, &output_path, None, None, false)
+            .expect("normalize");
+        assert_eq!(report.version_number, Some(3));
+        assert!(report.published_output.ends_with("normalized-v003.docx"));
+        assert!(report.published_output.exists());
     }
 
     #[test]

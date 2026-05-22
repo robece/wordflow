@@ -10,6 +10,7 @@ use wordflow::{
     add_comment_to_docx, apply_spec_file_to_docx, apply_spec_file_to_docx_dry_run,
     delete_docx_comment, diff_docx_files, find_anchors_in_docx,
     inspect_normalization_file, list_docx_parts, migrate_source_to_ooxml, normalize_docx_file,
+    normalize_docx_file_to_versioned_output,
     list_docx_comments, prepare_work_session, publish_session_to_next_version,
     publish_spec_file_to_docx, publish_spec_file_to_next_version, update_docx_comment,
     validate_docx_file, validate_source_fidelity_file, validate_spec_file, ParagraphStyle,
@@ -206,9 +207,13 @@ enum Commands {
         #[arg(long)]
         input: PathBuf,
 
-        /// Output normalized OOXML .docx.
+        /// Output normalized OOXML .docx, or the unversioned base path when --version-output is used.
         #[arg(long)]
         output: PathBuf,
+
+        /// Publish the normalized result as the next versioned output (for example, base.docx -> base-v001.docx).
+        #[arg(long, default_value_t = false)]
+        version_output: bool,
 
         /// Temp root reserved for future normalization backends.
         #[arg(long)]
@@ -601,24 +606,46 @@ fn main() -> Result<()> {
         Commands::Normalize {
             input,
             output,
+            version_output,
             temp_root,
             trusted_ooxml,
             allow_word_com_encrypted_package,
         } => {
-            let report = normalize_docx_file(
-                &input,
-                &output,
-                temp_root.as_deref(),
-                trusted_ooxml.as_deref(),
-                allow_word_com_encrypted_package,
-            )?;
-            println!(
-                "Normalized {}\tFormat\t{}\tAlready normalized\t{}\tXML checked\t{}",
-                report.published_output.display(),
-                report.detected_format.as_str(),
-                report.already_normalized,
-                report.xml_parts_checked
-            );
+            let report = if version_output {
+                normalize_docx_file_to_versioned_output(
+                    &input,
+                    &output,
+                    temp_root.as_deref(),
+                    trusted_ooxml.as_deref(),
+                    allow_word_com_encrypted_package,
+                )?
+            } else {
+                normalize_docx_file(
+                    &input,
+                    &output,
+                    temp_root.as_deref(),
+                    trusted_ooxml.as_deref(),
+                    allow_word_com_encrypted_package,
+                )?
+            };
+            if let Some(version_number) = report.version_number {
+                println!(
+                    "Normalized {}\tFormat\t{}\tAlready normalized\t{}\tXML checked\t{}\tVersion\tv{:03}",
+                    report.published_output.display(),
+                    report.detected_format.as_str(),
+                    report.already_normalized,
+                    report.xml_parts_checked,
+                    version_number
+                );
+            } else {
+                println!(
+                    "Normalized {}\tFormat\t{}\tAlready normalized\t{}\tXML checked\t{}",
+                    report.published_output.display(),
+                    report.detected_format.as_str(),
+                    report.already_normalized,
+                    report.xml_parts_checked
+                );
+            }
         }
         Commands::Inspect { input } => {
             let normalization = inspect_normalization_file(&input)?;
